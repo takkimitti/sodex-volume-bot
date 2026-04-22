@@ -1,0 +1,8 @@
+.env
+.env.*
+*.key
+__pycache__/
+*.log*
+*.csv
+*.json
+*.save
