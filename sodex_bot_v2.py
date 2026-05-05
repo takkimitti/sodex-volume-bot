@@ -37,7 +37,7 @@ logging.basicConfig(
         logging.StreamHandler(),
     ],
 )
-logger = logging.getLogger("SoDEX_v2.5")
+logger = logging.getLogger("SoDEX_v3.4.0")
 
 ORDER_SIDE_BUY = 1
 ORDER_SIDE_SELL = 2
@@ -50,11 +50,12 @@ CONFIG = {
     "symbol": "BTC-USD",
     "symbol_id": 1,
     "leverage": 10,
-    "risk_per_trade": 0.01,
     "min_size": 0.001,
     "max_size": 0.01,
     "fallback_size": 0.002,
     "kline_interval": "5m",
+    
+    # テクニカル期間設定
     "rsi_period": 14,
     "adx_period": 14,
     "ema_period": 50,
@@ -62,33 +63,44 @@ CONFIG = {
     "bb_std_dev": 2,
     "atr_period": 14,
     "volume_sma_period": 20,
+    
+    # 🎯 エントリー設定（ノイズ排除・勝率特化）
     "trend_rsi_buy_max": 47,
     "trend_rsi_sell_min": 53,
-    "trend_adx_min": 18,
-    "min_score_to_enter": 2,
+    "trend_adx_min": 22,            # 【激変】18 -> 22 (レンジのダマシを完全排除)
+    "min_score_to_enter": 3,        
+    "min_score_to_enter_scalp": 4,  
     "scalp_rsi_buy_max": 35,
     "scalp_rsi_sell_min": 65,
-    "secure_trigger_atr_mult": 1.2,
-    "secure_floor_atr_mult": 0.6,
+    
+    # 🎯 決済設定（利益伸長・チキン利食い防止）
     "take_profit_atr_mult": 3.0,
-    "stop_loss_atr_mult": 2.0,
+    "stop_loss_atr_mult": 2.5,
+    "tp_cap_pct_trend": 0.10,       # 【新規】TREND時は最大10%まで利益を伸ばす
+    "tp_cap_pct_scalp": 0.04,       # 【新規】SCALP時は4%でサクッと逃げる
+    "sl_cap_pct": 0.025,            
+    "secure_trigger_atr_mult": 1.5, # 【激変】1.0 -> 1.5 (すぐには守りに入らない)
+    "secure_floor_atr_mult": 0.8,   # 【激変】0.5 -> 0.8 (ノイズで降ろされない)
+    
+    # 🎯 ダイナミックリスク設定（期待値最大化）
+    "risk_per_trade_base": 0.015,   # 【変更】基本リスク 1.2% -> 1.5% (勝負に出る)
+    "risk_dvol_high": 0.005,        
     "dvol_threshold": 75,
-    "dvol_extreme": 90,
+    "dvol_extreme": 85,             
     "dvol_api_url": "https://www.deribit.com/api/v2/public/get_index_price?index_name=btcdvol_usdc",
-    "orderbook_slippage": 0.5,
-    "avoid_hours_start": 0,
-    "avoid_hours_end": 6,
+    
     "volume_filter_mult": 0.7,
     "funding_rate_threshold": 0.01,
     "oi_change_threshold": 0.03,
     "book_imbalance_threshold": 0.6,
+    
     "max_loss_per_session": 15.0,
     "cooldown_minutes": 5,
     "lockout_minutes": 90,
-    "force_close_retries": 3,
     "force_close_slippages": [0.01, 0.03, 0.05],
-    "force_close_confirm_wait": 2,
-    "force_close_confirm_checks": 5,
+    "force_close_confirm_wait": 3,
+    "force_close_confirm_checks": 10,
+    
     "macro_filter_enabled": True,
     "macro_api_url": "https://openapi.sosovalue.com/openapi/v1/macro/events",
     "macro_fetch_interval": 86400,
@@ -131,6 +143,21 @@ def append_trade_log(row: dict):
 
 def compute_indicators(df: pd.DataFrame, cfg: dict) -> dict | None:
     try:
+        mapping = {
+            "o": "o", "open": "o",
+            "h": "h", "high": "h",
+            "l": "l", "low": "l",
+            "c": "c", "close": "c",
+            "v": "v", "vol": "v", "volume": "v",
+        }
+        rename_map = {col: mapping[col.lower()] for col in df.columns if col.lower() in mapping}
+        df = df.rename(columns=rename_map)
+        df = df.loc[:, ~df.columns.duplicated(keep="last")]
+        
+        for col in ["o", "h", "l", "c", "v"]:
+            if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=["o", "h", "l", "c"])
+
         close = df["c"]
         high = df["h"]
         low = df["l"]
@@ -144,7 +171,7 @@ def compute_indicators(df: pd.DataFrame, cfg: dict) -> dict | None:
         bbl_series = bb_ind.bollinger_lband()
         
         atr_series = AverageTrueRange(high=high, low=low, close=close, window=cfg["atr_period"]).average_true_range()
-        vol_sma = df["v"].rolling(window=cfg["volume_sma_period"]).mean()
+        vol_sma = df["v"].rolling(window=cfg["volume_sma_period"]).mean() if "v" in df.columns else pd.Series(0, index=df.index)
 
         last_idx = len(df) - 1
         result = {
@@ -154,7 +181,7 @@ def compute_indicators(df: pd.DataFrame, cfg: dict) -> dict | None:
             "atr": atr_series.iloc[last_idx],
             "bb_upper": bbu_series.iloc[last_idx],
             "bb_lower": bbl_series.iloc[last_idx],
-            "volume": df["v"].iloc[last_idx],
+            "volume": df["v"].iloc[last_idx] if "v" in df.columns else 0,
             "vol_sma": vol_sma.iloc[last_idx] if not pd.isna(vol_sma.iloc[last_idx]) else 0,
         }
 
@@ -174,7 +201,9 @@ class SodexAdvancedBotV2:
         self.account_id = account_id
         self.private_key = private_key_hex
         self.account = Account.from_key(private_key_hex)
-        self.wallet_address = wallet_address or self.account.address
+        
+        # 【最重要修正】大文字小文字問題を回避するための .lower() 処理
+        self.wallet_address = (wallet_address or self.account.address).lower()
 
         if is_testnet:
             self.rest_url = "https://testnet-gw.sodex.dev/api/v1/perps"
@@ -188,24 +217,28 @@ class SodexAdvancedBotV2:
         self._sodex = requests.Session()
         self._sodex.headers.update({
             "Accept": "application/json",
-            "User-Agent": "SoDEX-Bot/2.5",
+            "User-Agent": "SoDEX-Bot/3.4.0",
             "X-API-Key": self.api_key,
         })
 
         self._public = requests.Session()
         self._public.headers.update({
             "Accept": "application/json",
-            "User-Agent": "SoDEX-Bot/2.5",
+            "User-Agent": "SoDEX-Bot/3.4.0",
         })
 
         self.latest_btc_price = None
         self.last_order_time = 0
         self.last_close_time = 0
-        self.is_profit_secured = False
-        self.last_entry_price = None
-        self.position_side = None
-        self.current_size = CONFIG["fallback_size"]
+        self.sync_mismatch_count = 0
+        self.entry_fail_count = 0
+        
+        # PENDINGロック用の変数
+        self.is_sync_pending = False
+        self.sync_pending_since = 0
+        
         self.current_mode = "TREND"
+        self._reset_local_state()
 
         self.current_atr = None
         self.current_indicators = None
@@ -225,28 +258,35 @@ class SodexAdvancedBotV2:
         self.lockout_time = {"BUY": 0, "SELL": 0}
         self.session_data = self._load_session_data()
 
-        self.entry_mode = None
-        self.entry_atr = None
-        self.entry_dvol = None
-        self.entry_rsi = None
-        self.entry_adx = None
-
         self.ET = pytz.timezone("US/Eastern")
         self.UTC = pytz.utc
         self.macro_events = {}
         self.last_macro_fetch = 0
 
         self._ws = None
-        self._ws_lock = threading.Lock()
+        self._stop_ws = threading.Event()
         self._stop_ping = threading.Event()
 
         init_trade_log()
 
         logger.info("=" * 58)
-        logger.info("  SoDEX Bot v2.5 - Multi-Entry Prevention Guard")
+        logger.info("  SoDEX Bot v3.4.0 - ALPHA SEEKER (Dynamic Risk & Cap)")
         logger.info(f"  ネットワーク: {'TESTNET' if is_testnet else 'MAINNET'}")
         logger.info(f"  ウォレット: {self.wallet_address}")
         logger.info("=" * 58)
+
+    def _reset_local_state(self):
+        self.position_side = None
+        self.last_entry_price = None
+        self.is_profit_secured = False
+        self.entry_mode = None
+        self.entry_atr = None
+        self.entry_dvol = None
+        self.entry_rsi = None
+        self.entry_adx = None
+        self.current_size = CONFIG["fallback_size"]
+        self.is_sync_pending = False
+        self.sync_pending_since = 0
 
     def _send_email(self, subject: str, text: str, is_html: bool = False):
         if not CONFIG["gmail_user"] or not CONFIG["gmail_pass"]: return
@@ -269,12 +309,13 @@ class SodexAdvancedBotV2:
         side = pos_info["side"]
         entry = pos_info["entry"]
         size = pos_info["size"]
+        
+        pnl_usd = (exit_price - entry) * size if side == "BUY" else (entry - exit_price) * size
         pnl_pct = (exit_price - entry) / entry if side == "BUY" else (entry - exit_price) / entry
         roe = pnl_pct * CONFIG["leverage"] * 100
-        pnl_usdt = pnl_pct * exit_price * size
 
         color = "#2ecc71" if roe > 0 else "#e74c3c"
-        subject = f"【SoDEX v2.5】{'利確' if roe > 0 else '損切'}完了 ({side})"
+        subject = f"【SoDEX v3.4.0】{'利確' if roe > 0 else '損切'}完了 ({side})"
         html = f"""
         <div style="font-family: sans-serif; padding: 20px; border: 1px solid #eee;">
             <h2 style="color: {color}; border-bottom: 2px solid;">{reason} 実行報告</h2>
@@ -283,11 +324,11 @@ class SodexAdvancedBotV2:
                     <td style="text-align: right;">{side} ({size} BTC)</td></tr>
                 <tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><b>エントリー建値</b></td>
                     <td style="text-align: right;">${int(entry)}</td></tr>
-                <tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><b>決済(市場)価格</b></td>
+                <tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><b>決済価格</b></td>
                     <td style="text-align: right;">${int(exit_price)}</td></tr>
                 <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-size: 1.2em;"><b>損益 (ROE)</b></td>
                     <td style="text-align: right; color: {color}; font-size: 1.2em;">
-                    <b>{roe:+.2f}% (${pnl_usdt:+.4f})</b></td></tr>
+                    <b>{roe:+.2f}% (${pnl_usd:+.2f})</b></td></tr>
             </table>
         </div>
         """
@@ -310,8 +351,10 @@ class SodexAdvancedBotV2:
         return {"currentSession": self._get_session_id(), "totalLoss": 0, "status": "ACTIVE"}
 
     def _save_session_data(self):
-        with open(SESSION_LOG_FILE, "w") as f:
+        temp_file = str(SESSION_LOG_FILE) + ".tmp"
+        with open(temp_file, "w") as f:
             json.dump(self.session_data, f, indent=2)
+        os.replace(temp_file, SESSION_LOG_FILE)
 
     def _check_session(self):
         now_id = self._get_session_id()
@@ -356,7 +399,7 @@ class SodexAdvancedBotV2:
 
             if self.session_data["totalLoss"] >= CONFIG["max_loss_per_session"]:
                 self.session_data["status"] = "STOPPED"
-                self._send_email("【SoDEX v2.5】セッション最大損失超過", f"累計損失: ${self.session_data['totalLoss']:.2f}\nBot停止")
+                self._send_email("【SoDEX v3.4.0】セッション最大損失超過", f"累計損失: ${self.session_data['totalLoss']:.2f}\nBot停止")
                 logger.critical("SESSION STOPPED: 最大損失超過")
             self._save_session_data()
         else:
@@ -366,15 +409,23 @@ class SodexAdvancedBotV2:
         try:
             res = self._sodex.get(
                 f"{self.rest_url}/accounts/{self.wallet_address}/state", 
-                params={"accountID": self.account_id}, # API精度向上のため追加
+                params={"accountID": self.account_id, "t": int(time.time() * 1000)},
                 timeout=5
             ).json()
-            positions = res.get("data", {}).get("P", [])
+            data = res.get("data", {})
+            positions = data.get("P", []) or data.get("positions", [])
+            
+            if positions is None: # Nullが返ってきた場合の安全処理
+                positions = []
+                
+            base_asset = CONFIG["symbol"].split("-")[0]
+            
             for p in positions:
-                symbol = str(p.get("s", ""))
-                size = float(p.get("sz", 0) or 0)
-                entry = float(p.get("ep", 0) or 0)
-                if "BTC" in symbol and abs(size) > 0:
+                symbol = str(p.get("s", p.get("symbol", "")))
+                size = float(p.get("sz", p.get("size", p.get("positionAmt", 0))) or 0)
+                entry = float(p.get("ep", p.get("entryPrice", 0)) or 0)
+                
+                if (symbol == CONFIG["symbol"] or symbol == base_asset) and abs(size) > 0:
                     return {"side": "BUY" if size > 0 else "SELL", "entry": entry, "size": abs(size)}
             return None
         except Exception as e:
@@ -383,15 +434,20 @@ class SodexAdvancedBotV2:
 
     def _reconcile_position(self, synced: dict | None):
         if synced:
+            self.sync_mismatch_count = 0  
             if self.position_side is None or synced["side"] != self.position_side:
-                logger.warning(f"SYNC REPLACE: local={self.position_side} → api={synced['side']} entry=${synced['entry']:.2f} size={synced['size']}")
+                logger.warning(f"SYNC REPLACE (NEW POSITION): local={self.position_side} → api={synced['side']} entry=${synced['entry']:.2f} size={synced['size']}")
                 self.position_side = synced["side"]
                 self.last_entry_price = synced["entry"]
                 self.current_size = synced["size"]
                 self.is_profit_secured = False
-                self.entry_mode = self.current_mode
-                self.entry_atr = self.current_atr
-                self.entry_dvol = self.current_dvol
+                
+                if not self.entry_mode:
+                    self.entry_mode = self.current_mode
+                if not self.entry_atr:
+                    self.entry_atr = self.current_atr
+                if not self.entry_dvol:
+                    self.entry_dvol = self.current_dvol
                 return
             
             if abs(self.current_size - synced["size"]) > 0.0001:
@@ -400,15 +456,20 @@ class SodexAdvancedBotV2:
                 self.last_entry_price = synced["entry"]
         else:
             if self.position_side is not None:
-                # ★最大の修正ポイント: APIが空を返しても、ローカルの記憶を勝手に消さない
-                logger.warning(f"SYNC MISMATCH: ローカルでは {self.position_side} 保有中ですが、APIから取得できません。多重発注を防ぐため状態を維持します。")
-                # メモリは消さないため、ボットは常に「ポジション保有中」と認識し、絶対に追撃発注しなくなります。
+                self.sync_mismatch_count += 1
+                logger.warning(f"SYNC MISMATCH ({self.sync_mismatch_count}/10): ローカルでは {self.position_side} 保有中ですが、APIから取得できません。")
+                
+                if self.sync_mismatch_count >= 10:
+                    logger.critical("SYNC MISMATCH が10回連続したため、ポジション情報を強制リセットします。")
+                    self._send_email("【SoDEX v3.4.0】ポジション強制リセット", "APIからポジションが連続して取得できなかったため、ローカルのポジション情報をクリアしました。")
+                    self._reset_local_state()
+                    self.sync_mismatch_count = 0
 
     def _get_recent_fills(self, symbol: str, limit: int = 10) -> list:
         try:
             res = self._sodex.get(
                 f"{self.rest_url}/accounts/{self.wallet_address}/trades",
-                params={"accountID": self.account_id, "symbol": symbol, "limit": limit},
+                params={"accountID": self.account_id, "symbol": symbol, "limit": limit, "t": int(time.time() * 1000)},
                 timeout=5
             ).json()
             if res.get("code") == 0 and res.get("data"):
@@ -419,31 +480,31 @@ class SodexAdvancedBotV2:
             return []
 
     def _force_close(self, current_price: float, reason: str) -> bool:
-        synced = self._sync_position()
-        
-        # ★修正ポイント: APIが空でも、ローカルの記憶を元に強制的に決済を投げる
-        side = synced["side"] if synced else self.position_side
-        size = synced["size"] if synced else self.current_size
-        
-        if not side: return True
-
-        close_side = "SELL" if side == "BUY" else "BUY"
-
         for i, slip in enumerate(CONFIG["force_close_slippages"]):
+            synced = self._sync_position()
+            if synced is None:
+                logger.info("FORCE CLOSE OK: 既にポジションは解消されています。")
+                return True
+                
+            side = synced["side"]
+            size = synced["size"]
+            close_side = "SELL" if side == "BUY" else "BUY"
+            
             exec_price = int(round(current_price * (1 + slip))) if close_side == "BUY" else int(round(current_price * (1 - slip)))
             logger.info(f"FORCE CLOSE ({i+1}): {reason} | {close_side} {size} BTC @ ${exec_price:.2f}")
-
+            
             if self._place_order(close_side, current_price, size, is_close=True, override_price=exec_price):
-                for check in range(CONFIG["force_close_confirm_checks"]):
+                for _ in range(CONFIG["force_close_confirm_checks"]):
                     time.sleep(CONFIG["force_close_confirm_wait"])
                     if self._sync_position() is None:
                         logger.info("FORCE CLOSE OK: 約定確認完了")
                         return True
-                logger.warning("FORCE CLOSE: 決済注文送信完了 (API反映が遅れている可能性がありますが成功とみなします)")
-                return True 
-
-        logger.error(f"FORCE CLOSE FAILED: {reason} → 手動確認必要")
-        self._send_email("【SoDEX v2.5】決済失敗", f"決済が完了しませんでした。SoDEX画面を確認してください。\n理由: {reason}")
+                
+                logger.warning("FORCE CLOSE NOT CONFIRMED: 決済がAPIに反映されません。次のスリッページ段階へ移行します。")
+                continue
+                
+        logger.error(f"FORCE CLOSE FAILED: {reason} → 決済確認が取れませんでした。手動確認が必要です。")
+        self._send_email("【SoDEX v3.4.0】決済失敗 / 未確認", f"決済注文を送信しましたが、API上でポジションの消失が確認できませんでした。\n二重保有を防ぐためローカル状態を保持しています。SoDEX画面を至急確認してください。\n理由: {reason}")
         return False
 
     def _convert_et_to_utc_timestamp(self, date_str: str, et_time: dtime) -> float:
@@ -451,20 +512,18 @@ class SodexAdvancedBotV2:
         event_et = self.ET.localize(datetime(
             year=event_date.year, month=event_date.month, day=event_date.day,
             hour=et_time.hour, minute=et_time.minute,
-        ), is_dst=None)
+        ), is_dst=False)
         return event_et.astimezone(self.UTC).timestamp()
 
     def _fetch_macro_schedule(self):
         if not CONFIG["macro_filter_enabled"]: return
         api_key = os.getenv("SOSOVALUE_API_KEY", "")
         if not api_key: return
-
         try:
             res = self._public.get(CONFIG["macro_api_url"], headers={"x-soso-api-key": api_key}, timeout=10).json()
             today_utc = datetime.now(self.UTC)
             target_dates = {today_utc.strftime("%Y-%m-%d"), (today_utc - timedelta(days=1)).strftime("%Y-%m-%d")}
             self.macro_events.clear()
-
             events_list = res.get("data", []) if isinstance(res, dict) else res
             for item in events_list:
                 date_str = item.get("date")
@@ -491,19 +550,12 @@ class SodexAdvancedBotV2:
         if not CONFIG["macro_filter_enabled"]: return "NORMAL"
         self._cleanup_macro_events()
         if not self.macro_events: return "NORMAL"
-
         now = time.time()
         for event_ts, shield_min in self.macro_events.items():
             diff = now - event_ts
             if abs(diff) <= (shield_min * 60):
                 return "PRE_EVENT" if diff < 0 else "POST_EVENT"
         return "NORMAL"
-
-    def _is_post_event_safe(self) -> bool:
-        now = time.time()
-        for event_ts in self.macro_events.keys():
-            if 0 <= (now - event_ts) < 300: return False
-        return True
 
     def _is_spread_safe(self) -> bool:
         if self.best_bid and self.best_ask and self.best_ask > 0:
@@ -515,7 +567,7 @@ class SodexAdvancedBotV2:
         now = time.time()
         if now - self.last_dvol_fetch < 15 * 60: return self.current_dvol
         try:
-            res = self._public.get(CONFIG["dvol_api_url"], timeout=5).json()
+            res = self._public.get(CONFIG["dvol_api_url"], params={"t": int(time.time() * 1000)}, timeout=5).json()
             if "result" in res and "index_price" in res["result"]:
                 self.current_dvol = float(res["result"]["index_price"])
                 self.last_dvol_fetch = now
@@ -529,74 +581,36 @@ class SodexAdvancedBotV2:
         if self.current_indicators and now - self.last_indicator_fetch < 20:
             return self.current_indicators
         try:
-            res = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/klines", 
-                               params={"interval": CONFIG["kline_interval"], "limit": 200}, timeout=10).json()
+            res = self._sodex.get(
+                f"{self.rest_url}/markets/{CONFIG['symbol']}/klines", 
+                params={"interval": CONFIG["kline_interval"], "limit": 250, "t": int(time.time() * 1000)}, 
+                timeout=10
+            ).json()
             if res.get("code") == 0 and res.get("data"):
                 raw_data = res["data"]
-                if isinstance(raw_data, list) and len(raw_data) > 0:
-                    sample = raw_data[0]
-                    if isinstance(sample, dict):
-                        col_map = {}
-                        for key in sample.keys():
-                            kl = key.lower()
-                            if kl in ("o", "open"): col_map[key] = "o"
-                            elif kl in ("h", "high"): col_map[key] = "h"
-                            elif kl in ("l", "low"): col_map[key] = "l"
-                            elif kl in ("c", "close"): col_map[key] = "c"
-                            elif kl in ("v", "vol", "volume"): col_map[key] = "v"
-                        df = pd.DataFrame(raw_data)
-                        if col_map: df = df.rename(columns=col_map)
-                    elif isinstance(sample, list):
-                        if len(sample) >= 6: df = pd.DataFrame(raw_data, columns=["t", "o", "h", "l", "c", "v"] + [f"x{i}" for i in range(len(sample)-6)])
-                        else: df = pd.DataFrame(raw_data)
-                    else:
-                        df = pd.DataFrame(raw_data)
-
-                    if "t" in df.columns:
-                        df["t"] = pd.to_numeric(df["t"], errors="coerce")
-                        df = df.sort_values("t").reset_index(drop=True)
-                    elif "T" in df.columns:
-                        df["T"] = pd.to_numeric(df["T"], errors="coerce")
-                        df = df.sort_values("T").reset_index(drop=True)
-
-                    for col in ["o", "h", "l", "c", "v"]:
-                        if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
-                    
-                    required_cols = {"o", "h", "l", "c", "v"}
-                    if not required_cols.issubset(set(df.columns)): return None
-
-                    df = df.dropna(subset=["o", "h", "l", "c"])
-                    if len(df) < CONFIG["ema_period"] + 10: return None
-
-                    indicators = compute_indicators(df, CONFIG)
-                    if indicators:
-                        self.current_indicators = indicators
-                        self.current_atr = indicators["atr"]
-                        self.last_indicator_fetch = now
-                        return indicators
+                df = pd.DataFrame(raw_data)
+                indicators = compute_indicators(df, CONFIG)
+                if indicators:
+                    self.current_indicators = indicators
+                    self.current_atr = indicators["atr"]
+                    self.last_indicator_fetch = now
+                    return indicators
         except Exception as e:
             logger.error(f"kline取得例外: {e}")
         return None
 
     def _get_orderbook(self) -> dict | None:
         try:
-            res = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/orderbook", params={"depth": 5}, timeout=5).json()
+            res = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/orderbook", params={"depth": 5, "t": int(time.time() * 1000)}, timeout=5).json()
             if res.get("code") == 0 and res.get("data"):
                 book = res["data"]
-                bids = book.get("bids", [])
-                asks = book.get("asks", [])
+                bids, asks = book.get("bids", []), book.get("asks", [])
                 if bids and asks:
                     parse_p = lambda e: float(e.get("price", e.get("p", 0))) if isinstance(e, dict) else float(e[0])
                     parse_q = lambda e: float(e.get("quantity", e.get("q", 0))) if isinstance(e, dict) else float(e[1])
-                    self.best_bid = parse_p(bids[0])
-                    self.best_ask = parse_p(asks[0])
-                    bid_vol = sum(parse_q(b) for b in bids[:5])
-                    ask_vol = sum(parse_q(a) for a in asks[:5])
-                    return {
-                        "best_bid": self.best_bid, "best_ask": self.best_ask,
-                        "bid_volume": bid_vol, "ask_volume": ask_vol,
-                        "imbalance": bid_vol / (bid_vol + ask_vol) if (bid_vol + ask_vol) > 0 else 0.5,
-                    }
+                    self.best_bid, self.best_ask = parse_p(bids[0]), parse_p(asks[0])
+                    bid_vol, ask_vol = sum(parse_q(b) for b in bids[:5]), sum(parse_q(a) for a in asks[:5])
+                    return {"best_bid": self.best_bid, "best_ask": self.best_ask, "imbalance": bid_vol / (bid_vol + ask_vol) if (bid_vol + ask_vol) > 0 else 0.5}
         except Exception: pass
         return None
 
@@ -604,7 +618,7 @@ class SodexAdvancedBotV2:
         now = time.time()
         if now - self.last_funding_fetch < 5 * 60: return self.current_funding_rate
         try:
-            res = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/funding-rate", timeout=5).json()
+            res = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/funding-rate", params={"t": int(time.time() * 1000)}, timeout=5).json()
             if res.get("code") == 0 and res.get("data"):
                 self.current_funding_rate = float(res["data"].get("fundingRate", 0))
                 self.last_funding_fetch = now
@@ -614,405 +628,305 @@ class SodexAdvancedBotV2:
     def _get_open_interest(self) -> float | None:
         now = time.time()
         if now - self.last_oi_fetch < 5 * 60:
-            if self.current_oi and self.previous_oi and self.previous_oi > 0:
-                return (self.current_oi - self.previous_oi) / self.previous_oi
-            return None
+            return (self.current_oi - self.previous_oi) / self.previous_oi if self.current_oi and self.previous_oi else None
         try:
-            res = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/open-interest", timeout=5).json()
+            res = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/open-interest", params={"t": int(time.time() * 1000)}, timeout=5).json()
             if res.get("code") == 0 and res.get("data"):
-                self.previous_oi = self.current_oi
-                self.current_oi = float(res["data"].get("openInterest", 0))
+                self.previous_oi, self.current_oi = self.current_oi, float(res["data"].get("openInterest", 0))
                 self.last_oi_fetch = now
-                if self.previous_oi and self.previous_oi > 0:
-                    return (self.current_oi - self.previous_oi) / self.previous_oi
+                return (self.current_oi - self.previous_oi) / self.previous_oi if self.previous_oi else None
         except Exception: self.last_oi_fetch = now
         return None
 
     def _calculate_position_size(self, stop_loss_distance: float) -> float:
         balance = 0
         try:
-            res = self._sodex.get(f"{self.rest_url}/accounts/{self.account_id}/balance", timeout=5).json()
-            if res.get("code") == 0 and res.get("data"):
-                balance = float(res["data"].get("availableBalance", 0))
+            res = self._sodex.get(f"{self.rest_url}/accounts/{self.account_id}/balance", params={"t": int(time.time() * 1000)}, timeout=5).json()
+            if res.get("code") == 0 and res.get("data"): balance = float(res["data"].get("availableBalance", 0))
         except Exception: pass
-        
         if balance <= 0 or stop_loss_distance <= 0: return float(CONFIG["fallback_size"])
-        raw_size = (balance * CONFIG["risk_per_trade"]) / stop_loss_distance
-        size = max(CONFIG["min_size"], min(CONFIG["max_size"], raw_size))
+        
+        # --- DVOL連動リスクの適用 (v3.4.0) ---
+        dvol = self.current_dvol
+        if dvol > CONFIG["dvol_extreme"]:
+            current_risk = CONFIG["risk_dvol_high"]
+            logger.info(f"Risk Adjusted: HIGH DVOL ({dvol:.1f}) -> Risk {current_risk*100}%")
+        elif dvol < 60:
+            current_risk = CONFIG["risk_per_trade_base"]
+            logger.info(f"Risk Adjusted: LOW DVOL ({dvol:.1f}) -> Risk {current_risk*100}%")
+        else:
+            current_risk = 0.010
+            
+        size = max(CONFIG["min_size"], min(CONFIG["max_size"], (balance * current_risk) / stop_loss_distance))
         return math.floor(size * 1000) / 1000
 
     def _generate_eip712_signature(self, params: OrderedDict, nonce: int) -> str:
         payload = OrderedDict([("type", "newOrder"), ("params", params)])
         payload_json = json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
         keccak = lambda b: Web3.keccak(b)
+        domain_sep = keccak(keccak(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)") + keccak(b"futures") + keccak(b"1") + self.chain_id.to_bytes(32, 'big') + bytes(32))
+        struct_hash  = keccak(bytes(keccak(b"ExchangeAction(bytes32 payloadHash,uint64 nonce)")) + bytes(keccak(payload_json.encode('utf-8'))) + nonce.to_bytes(32, 'big'))
+        signed = self.account.unsafe_sign_hash(keccak(b'\x19\x01' + bytes(domain_sep) + bytes(struct_hash)))
         
-        domain_sep = keccak(
-            keccak(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)") +
-            keccak(b"futures") + keccak(b"1") + self.chain_id.to_bytes(32, 'big') + bytes(32)
-        )
-        action_type_hash = keccak(b"ExchangeAction(bytes32 payloadHash,uint64 nonce)")
-        payload_hash = keccak(payload_json.encode('utf-8'))
-        struct_hash  = keccak(bytes(action_type_hash) + bytes(payload_hash) + nonce.to_bytes(32, 'big'))
-        digest       = keccak(b'\x19\x01' + bytes(domain_sep) + bytes(struct_hash))
+        hex_sig = signed.signature.hex()
+        if hex_sig.startswith('0x'):
+            hex_sig = hex_sig[2:]
+        sig_bytes = bytes.fromhex(hex_sig)
         
-        signed  = self.account.unsafe_sign_hash(digest)
-        raw_hex = signed.signature.hex()
-        sig_bytes   = bytes.fromhex(raw_hex[2:] if raw_hex.startswith("0x") else raw_hex)
-        v_corrected = sig_bytes[-1] - 27
-        return "0x01" + (sig_bytes[:-1] + bytes([v_corrected])).hex()
+        return "0x01" + (sig_bytes[:-1] + bytes([sig_bytes[-1] - 27])).hex()
 
     def _place_order(self, side: str, base_price: float, size: float, is_close: bool = False, override_price: float = None) -> bool:
         self.last_order_time = time.time()
-        
-        if override_price is not None:
-            execute_price = int(round(override_price))
+        if override_price is not None: execute_price = int(round(override_price))
         else:
             book = self._get_orderbook()
-            slippage = CONFIG["orderbook_slippage"]
-            if book:
-                execute_price = book["best_ask"] + slippage if side == "BUY" else book["best_bid"] - slippage
-                logger.info(f"板基準: BID=${book['best_bid']:.2f} ASK=${book['best_ask']:.2f} → 執行=${execute_price:.2f}")
-            else:
-                execute_price = base_price * 1.005 if side == "BUY" else base_price * 0.995
-            execute_price = int(round(execute_price))
-
-        side_enum = ORDER_SIDE_BUY if side == "BUY" else ORDER_SIDE_SELL
+            execute_price = int(round(book["best_ask"] + 0.5 if side == "BUY" else book["best_bid"] - 0.5)) if book else int(round(base_price * (1.005 if side == "BUY" else 0.995)))
         nonce = int(time.time() * 1000)
-        
-        body_ordered = OrderedDict([
-            ("accountID", self.account_id),
-            ("symbolID", CONFIG["symbol_id"]),
-            ("orders", [
-                OrderedDict([
-                    ("clOrdID", str(uuid.uuid4())[:36]),
-                    ("modifier", MODIFIER_NORMAL),
-                    ("side", side_enum),
-                    ("type", ORDER_TYPE_LIMIT),
-                    ("timeInForce", TIF_IOC),
-                    ("price", str(execute_price)),
-                    ("quantity", str(size)),
-                    ("reduceOnly", is_close),
-                    ("positionSide", POSITION_SIDE_BOTH),
-                ])
-            ])
-        ])
-
-        body_json = json.dumps(body_ordered, separators=(',', ':'), ensure_ascii=False)
-        headers = {
-            "Content-Type": "application/json",
-            "X-API-Sign": self._generate_eip712_signature(body_ordered, nonce),
-            "X-API-Nonce": str(nonce),
-        }
-
+        body = OrderedDict([("accountID", self.account_id), ("symbolID", CONFIG["symbol_id"]), ("orders", [OrderedDict([("clOrdID", str(uuid.uuid4())[:36]), ("modifier", MODIFIER_NORMAL), ("side", ORDER_SIDE_BUY if side == "BUY" else ORDER_SIDE_SELL), ("type", ORDER_TYPE_LIMIT), ("timeInForce", TIF_IOC), ("price", str(execute_price)), ("quantity", str(size)), ("reduceOnly", is_close), ("positionSide", POSITION_SIDE_BOTH)])])])
+        headers = {"Content-Type": "application/json", "X-API-Sign": self._generate_eip712_signature(body, nonce), "X-API-Nonce": str(nonce)}
         try:
-            res = self._sodex.post(f"{self.rest_url}/trade/orders", headers=headers, data=body_json, timeout=10).json()
+            res = self._sodex.post(f"{self.rest_url}/trade/orders", headers=headers, data=json.dumps(body, separators=(',', ':')), timeout=10).json()
             if res.get("code") == 0:
-                action = "決済" if is_close else "新規"
-                logger.info(f"ORDER OK: {side} {action} {size} BTC @ ${execute_price}")
-                if not is_close:
-                    self._send_email(f"【SoDEX v2.5】{side} エントリー ({self.current_mode})", f"方向: {side}\n価格: ${execute_price}\nサイズ: {size} BTC")
-                    self.last_entry_price = base_price
-                    self.position_side = side
-                    self.current_size = size
-                    self.is_profit_secured = False
-                    self.entry_mode = self.current_mode
-                    self.entry_atr = self.current_atr
-                    self.entry_dvol = self.current_dvol
-                    if self.current_indicators:
-                        self.entry_rsi = self.current_indicators.get("rsi")
-                        self.entry_adx = self.current_indicators.get("adx")
+                logger.info(f"ORDER SENT (Awaiting Execution): {side} {'決済' if is_close else '新規'} {size} BTC @ ${execute_price}")
                 return True
-            else:
-                logger.error(f"ORDER REJECTED: {res}")
-        except Exception as e:
-            logger.error(f"注文エラー: {e}")
+        except Exception as e: logger.error(f"注文エラー: {e}")
         return False
 
     def _manage_position(self, current_price: float) -> bool:
         if not self.last_entry_price or not self.position_side: return False
-
-        atr = self.current_atr or self.entry_atr
-        if not atr or atr <= 0: atr = self.last_entry_price * 0.02
+        
+        atr = self.current_atr or self.entry_atr or self.last_entry_price * 0.02
         entry = self.last_entry_price
+        
+        # --- モード別 TP上限キャップの動的適用 ---
+        current_mode = self.entry_mode or self.current_mode
+        active_tp_cap = CONFIG["tp_cap_pct_trend"] if current_mode == "TREND" else CONFIG["tp_cap_pct_scalp"]
+        
+        # --- TP/SL 距離の計算 (ATRとCapの小さい方を採用) ---
+        tp_dist = min(atr * CONFIG["take_profit_atr_mult"], entry * active_tp_cap)
+        sl_dist = min(atr * CONFIG["stop_loss_atr_mult"], entry * CONFIG["sl_cap_pct"])
+        secure_trigger_dist = atr * CONFIG["secure_trigger_atr_mult"]
+        secure_floor_dist = atr * CONFIG["secure_floor_atr_mult"]
 
-        pnl_raw = (current_price - entry) / entry if self.position_side == "BUY" else (entry - current_price) / entry
-        pnl_roe = pnl_raw * 100 * CONFIG["leverage"]
-        pnl_usd = (current_price - entry) * self.current_size
-        if self.position_side == "SELL": pnl_usd = -pnl_usd
-
-        atr_roe = (atr / entry) * 100 * CONFIG["leverage"]
-        secure_trigger_roe = atr_roe * CONFIG["secure_trigger_atr_mult"]
-        secure_floor_roe = atr_roe * CONFIG["secure_floor_atr_mult"]
-        take_profit_roe = atr_roe * CONFIG["take_profit_atr_mult"]
-        stop_loss_roe = atr_roe * CONFIG["stop_loss_atr_mult"]
+        pnl_roe = ((current_price - entry) / entry if self.position_side == "BUY" else (entry - current_price) / entry) * 100 * CONFIG["leverage"]
+        
+        tp_roe = (tp_dist / entry) * 100 * CONFIG["leverage"]
+        sl_roe = (sl_dist / entry) * 100 * CONFIG["leverage"]
+        secure_trigger_roe = (secure_trigger_dist / entry) * 100 * CONFIG["leverage"]
+        secure_floor_roe = (secure_floor_dist / entry) * 100 * CONFIG["leverage"]
 
         if not self.is_profit_secured and pnl_roe >= secure_trigger_roe:
             self.is_profit_secured = True
-            logger.info(f"SECURE ON: ROE {pnl_roe:+.2f}%")
+            logger.info(f"SECURE ON: ROE {pnl_roe:+.2f}% (Trigger: {secure_trigger_roe:.1f}%)")
+            self._send_email("【SoDEX v3.4.1】利益確保モード作動", f"現在のROE: {pnl_roe:+.2f}%\n撤退ラインを {secure_floor_roe:+.1f}% に引き上げました。")
 
+        
         should_close, reason = False, ""
-        if pnl_roe >= take_profit_roe: should_close, reason = True, f"利確 (ATR x{CONFIG['take_profit_atr_mult']})"
-        elif pnl_roe <= -stop_loss_roe: should_close, reason = True, f"損切 (ATR x{CONFIG['stop_loss_atr_mult']})"
-        elif self.is_profit_secured and pnl_roe <= secure_floor_roe: should_close, reason = True, f"利益確保撤退 (ATR x{CONFIG['secure_floor_atr_mult']})"
-
-        if self.entry_mode == "SCALP" and not should_close:
-            if pnl_roe >= atr_roe * 1.5: should_close, reason = True, "SCALP利確"
-            elif pnl_roe <= -atr_roe * 1.0: should_close, reason = True, "SCALP損切"
+        if pnl_roe >= tp_roe: should_close, reason = True, f"利確 (Target: {tp_roe:.1f}%)"
+        elif pnl_roe <= -sl_roe: should_close, reason = True, f"損切 (Stop: -{sl_roe:.1f}%)"
+        elif self.is_profit_secured and pnl_roe <= secure_floor_roe: should_close, reason = True, "利益確保撤退"
 
         if should_close:
             if self._force_close(current_price, reason):
-                time.sleep(1)
-                fills = self._get_recent_fills(CONFIG["symbol"], limit=5)
-                actual_exit_price = current_price
-                if fills:
-                    actual_exit_price = float(fills[0].get("price", current_price))
-                    logger.info(f"実約定価格: ${actual_exit_price:.2f} (見積: ${current_price:.2f})")
-
-                self._record_pnl(self.position_side, pnl_usd, actual_exit_price, reason)
-                
-                # ★決済完了時のみローカル状態をクリアする
-                self.last_entry_price = None
-                self.position_side = None
-                self.is_profit_secured = False
+                fills = self._get_recent_fills(CONFIG["symbol"], limit=1)
+                exit_p = float(fills[0].get("price", current_price)) if fills else current_price
+                self._send_settlement_report({"side": self.position_side, "entry": self.last_entry_price, "size": self.current_size}, exit_p, reason)
+                self._record_pnl(self.position_side, (exit_p - entry if self.position_side == "BUY" else entry - exit_p) * self.current_size, exit_p, reason)
+                self._reset_local_state()
                 self.last_close_time = time.time()
-                self.entry_mode = None
-                self.entry_atr = None
                 return False 
         return True
 
     def _analyze(self, current_price: float) -> str:
-        # ★最終防衛ライン: ポジション保有中は絶対に分析（新規シグナル発行）しない
-        if self.position_side is not None:
+        if self.position_side: return "WAIT"
+            
+        macro_m = self._get_macro_mode()
+        if macro_m != "NORMAL":
             return "WAIT"
-
-        macro_mode = self._get_macro_mode()
-        if macro_mode == "PRE_EVENT" or (macro_mode == "POST_EVENT" and not self._is_post_event_safe()):
-            logger.debug(f"WAIT: マクロフィルター ({macro_mode})")
-            return "WAIT"
-
+            
         if not self._is_spread_safe(): return "WAIT"
-
+        
+        # --- DVOL連動スコアハードルの設定 (v3.4.0) ---
         dvol = self._get_safe_dvol()
-        if dvol >= CONFIG["dvol_extreme"]: return "WAIT"
-        elif dvol >= CONFIG["dvol_threshold"]: self.current_mode = "SCALP"
-        else: self.current_mode = "TREND"
-
+        dynamic_trend_score = CONFIG["min_score_to_enter"]
+        dynamic_scalp_score = CONFIG["min_score_to_enter_scalp"]
+        
+        if dvol > CONFIG["dvol_extreme"]: 
+            dynamic_trend_score += 1
+            dynamic_scalp_score += 1
+            
+        self.current_mode = "SCALP" if dvol >= CONFIG["dvol_threshold"] else "TREND"
         now = time.time()
-        buy_locked = now < self.lockout_time.get("BUY", 0)
-        sell_locked = now < self.lockout_time.get("SELL", 0)
-        if buy_locked and sell_locked: return "WAIT"
-
+        
+        can_buy = now >= self.lockout_time.get("BUY", 0)
+        can_sell = now >= self.lockout_time.get("SELL", 0)
+        if not can_buy and not can_sell: return "WAIT"
+        
         ind = self._get_market_data()
         if not ind: return "WAIT"
-
-        ema = ind["ema"]
-        rsi = ind["rsi"]
-        adx = ind["adx"]
-        bb_upper = ind["bb_upper"]
-        bb_lower = ind["bb_lower"]
-        volume = ind["volume"]
-        vol_sma = ind["vol_sma"]
-        adx_min = 40 if macro_mode == "POST_EVENT" else CONFIG["trend_adx_min"]
-
-        if vol_sma and vol_sma > 0 and volume < vol_sma * CONFIG["volume_filter_mult"]: return "WAIT"
-
+        ema, rsi, adx = ind["ema"], ind["rsi"], ind["adx"]
+        bb_upper, bb_lower = ind["bb_upper"], ind["bb_lower"]
+        
+        if ind["volume"] < ind["vol_sma"] * CONFIG["volume_filter_mult"]: return "WAIT"
         fr = self._get_funding_rate()
-        fr_buy_bonus = fr < -CONFIG["funding_rate_threshold"]
-        fr_sell_bonus = fr > CONFIG["funding_rate_threshold"]
-
         oi_change = self._get_open_interest()
         oi_confirms = oi_change is not None and abs(oi_change) > CONFIG["oi_change_threshold"]
-
         book = self._get_orderbook()
-        book_buy = book_sell = False
-        if book:
-            imb = book["imbalance"]
-            if imb > CONFIG["book_imbalance_threshold"]: book_buy = True
-            elif imb < (1 - CONFIG["book_imbalance_threshold"]): book_sell = True
-
+        imb = book["imbalance"] if book else 0.5
+        b_buy, b_sell = imb > CONFIG["book_imbalance_threshold"], imb < (1 - CONFIG["book_imbalance_threshold"])
+        
         signal = "WAIT"
-        min_score = CONFIG["min_score_to_enter"]
-
         if self.current_mode == "TREND":
-            buy_score = 0
-            buy_cond_price = current_price > ema
-            if buy_cond_price and not buy_locked:
-                if rsi < CONFIG["trend_rsi_buy_max"]: buy_score += 1
-                if adx > adx_min: buy_score += 1
-                if fr_buy_bonus: buy_score += 1
-                if oi_confirms: buy_score += 1
-                if book_buy: buy_score += 1
-                if rsi < 40: buy_score += 1
-
-            sell_score = 0
-            sell_cond_price = current_price < ema
-            if sell_cond_price and not sell_locked:
-                if rsi > CONFIG["trend_rsi_sell_min"]: sell_score += 1
-                if adx > adx_min: sell_score += 1
-                if fr_sell_bonus: sell_score += 1
-                if oi_confirms: sell_score += 1
-                if book_sell: sell_score += 1
-                if rsi > 60: sell_score += 1
-
-            if buy_score >= min_score: signal = "BUY"
-            elif sell_score >= min_score: signal = "SELL"
-            else:
-                logger.info(
-                    f"[TREND] P=${current_price:.0f} EMA=${ema:.0f} RSI={rsi:.1f} ADX={adx:.1f} | "
-                    f"BUY_score={buy_score}/{min_score} (p>ema={buy_cond_price}) | "
-                    f"SELL_score={sell_score}/{min_score} (p<ema={sell_cond_price}) | "
-                    f"FR={fr:.4f} OI={oi_confirms} Book={'B' if book_buy else 'S' if book_sell else '-'}"
-                )
-
+            buy_s = (1 if rsi < CONFIG["trend_rsi_buy_max"] else 0) + (1 if adx > CONFIG["trend_adx_min"] else 0) + (1 if fr < -CONFIG["funding_rate_threshold"] else 0) + (1 if oi_confirms else 0) + (1 if b_buy else 0)
+            sell_s = (1 if rsi > CONFIG["trend_rsi_sell_min"] else 0) + (1 if adx > CONFIG["trend_adx_min"] else 0) + (1 if fr > CONFIG["funding_rate_threshold"] else 0) + (1 if oi_confirms else 0) + (1 if b_sell else 0)
+            
+            if can_buy and buy_s >= dynamic_trend_score and current_price > ema: signal = "BUY"
+            elif can_sell and sell_s >= dynamic_trend_score and current_price < ema: signal = "SELL"
+            
+            if signal == "WAIT": logger.info(f"[TREND] P=${current_price:.0f} EMA=${ema:.0f} RSI={rsi:.1f} ADX={adx:.1f} | Scores: B={buy_s} S={sell_s} (Req:{dynamic_trend_score}) | canB={can_buy} canS={can_sell}")
+            
         elif self.current_mode == "SCALP":
-            buy_cond_rsi = rsi < CONFIG["scalp_rsi_buy_max"]
-            buy_cond_bb = current_price <= bb_lower * 1.01
-            sell_cond_rsi = rsi > CONFIG["scalp_rsi_sell_min"]
-            sell_cond_bb = current_price >= bb_upper * 0.99
-
-            if (buy_cond_rsi or buy_cond_bb) and not buy_locked: signal = "BUY"
-            elif (sell_cond_rsi or sell_cond_bb) and not sell_locked: signal = "SELL"
-            else:
-                logger.info(
-                    f"[SCALP] P=${current_price:.0f} RSI={rsi:.1f} BB=[{bb_lower:.0f},{bb_upper:.0f}] | "
-                    f"BUY: rsi<{CONFIG['scalp_rsi_buy_max']}={buy_cond_rsi} p<=bb_low={buy_cond_bb} | "
-                    f"SELL: rsi>{CONFIG['scalp_rsi_sell_min']}={sell_cond_rsi} p>=bb_up={sell_cond_bb}"
-                )
-
-        if signal != "WAIT":
-            logger.info(f">>> SIGNAL: {signal} ({self.current_mode}) | RSI={rsi:.1f} ADX={adx:.1f} FR={fr:.4f} OI_conf={oi_confirms} Book={'+BUY' if book_buy else '+SELL' if book_sell else 'neutral'} <<<")
+            # SCALPもスコア制に移行して厳格化 (v3.4.0)
+            buy_s = (1 if rsi < CONFIG["scalp_rsi_buy_max"] else 0) + (1 if current_price <= bb_lower * 1.01 else 0) + (1 if b_buy else 0) + (1 if fr < 0 else 0)
+            sell_s = (1 if rsi > CONFIG["scalp_rsi_sell_min"] else 0) + (1 if current_price >= bb_upper * 0.99 else 0) + (1 if b_sell else 0) + (1 if fr > 0 else 0)
+            
+            if can_buy and buy_s >= dynamic_scalp_score: signal = "BUY"
+            elif can_sell and sell_s >= dynamic_scalp_score: signal = "SELL"
+            if signal == "WAIT": logger.info(f"[SCALP] P=${current_price:.0f} RSI={rsi:.1f} BB=[{bb_lower:.0f},{bb_upper:.0f}] | Scores: B={buy_s} S={sell_s} (Req:{dynamic_scalp_score}) | canB={can_buy} canS={can_sell}")
+            
         return signal
 
     def _on_ws_message(self, ws, message):
         try:
             data = json.loads(message)
-            if data.get("op") == "pong": return
-            if data.get("channel") == "ticker" and "data" in data:
-                for item in data["data"]:
+            if data.get("channel") == "ticker":
+                for item in data.get("data", []):
                     if item.get("s") == CONFIG["symbol"]: self.latest_btc_price = float(item["c"])
         except Exception: pass
 
-    def _on_ws_error(self, ws, error):
-        logger.error(f"WebSocket Error: {error}")
-
-    def _on_ws_close(self, ws, close_status_code, close_msg):
-        if ws is not self._ws:
-            logger.debug("古いWebSocketからのclose callback → 無視")
-            return
-
-        logger.warning("WebSocket Closed, reconnecting in 5s...")
-        if hasattr(self, "_stop_ping"): self._stop_ping.set()
-        time.sleep(5)
-        self._start_websocket()
-
-    def _start_websocket(self):
-        with self._ws_lock:
-            if self._ws is not None:
-                try: self._ws.close()
-                except Exception: pass
-
-            self._stop_ping = threading.Event()
-
-            ws = websocket.WebSocketApp(
+    def _ws_maintainer(self):
+        while not self._stop_ws.is_set():
+            self._stop_ping.clear()
+            self._ws = websocket.WebSocketApp(
                 self.ws_url,
                 on_open=lambda w: w.send(json.dumps({"op": "subscribe", "params": {"channel": "ticker", "symbols": [CONFIG["symbol"]]}})),
                 on_message=self._on_ws_message,
-                on_error=self._on_ws_error,
-                on_close=self._on_ws_close,
+                on_error=lambda w, e: logger.error(f"WS Error: {e}"),
+                on_close=lambda w, c, m: logger.warning("WS Closed. Reconnecting...")
             )
-            self._ws = ws
-            threading.Thread(target=ws.run_forever, daemon=True).start()
-            
-            def ping_loop(stop_event):
-                while not stop_event.is_set():
-                    time.sleep(30)
-                    try:
-                        if ws.sock and ws.sock.connected: ws.send(json.dumps({"op": "ping"}))
-                    except Exception as e:
-                        logger.debug(f"Ping失敗: {e}")
-                        break
-            threading.Thread(target=ping_loop, args=(self._stop_ping,), daemon=True).start()
+            threading.Thread(target=self._pinger, daemon=True).start()
+            self._ws.run_forever()
+            self._stop_ping.set()
+            time.sleep(5)
+
+    def _pinger(self):
+        while not self._stop_ping.is_set() and not self._stop_ws.is_set():
+            time.sleep(30)
+            if self._ws and self._ws.sock and self._ws.sock.connected:
+                try: 
+                    self._ws.send(json.dumps({"op": "ping"}))
+                except Exception: 
+                    break
+
+    def _start_websocket(self):
+        self._stop_ws.clear()
+        threading.Thread(target=self._ws_maintainer, daemon=True).start()
 
     def run_strategy(self):
         self._start_websocket()
         self._fetch_macro_schedule()
         
-        wait_count = 0
+        wait_start = time.time()
         while self.latest_btc_price is None:
+            if time.time() - wait_start > 30:
+                logger.warning("WSからの価格取得がタイムアウト。REST APIでフォールバック取得を試みます。")
+                try:
+                    res = self._public.get(f"{self.rest_url}/markets/tickers", params={"symbol": CONFIG["symbol"], "t": int(time.time() * 1000)}, timeout=5).json()
+                    if res.get("code") == 0 and res.get("data"):
+                        data = res.get("data")
+                        if isinstance(data, list) and len(data) > 0:
+                            price = float(data[0].get("lastPx", 0))
+                            if price > 0:
+                                self.latest_btc_price = price
+                except Exception: pass
+                wait_start = time.time()
             time.sleep(1)
-            wait_count += 1
-            if wait_count > 30:
-                self._start_websocket()
-                wait_count = 0
-
+            
         logger.info(f"監視開始: ${self.latest_btc_price:.2f}")
-        loop_count = 0
-        last_heartbeat = time.time()
-
+        loop_c, last_h = 0, time.time()
         while True:
             try:
-                loop_count += 1
-                if time.time() - last_heartbeat >= 60:
-                    logger.info(f"[HEARTBEAT] loop={loop_count} price=${self.latest_btc_price} pos={'LONG' if self.position_side == 'BUY' else 'SHORT' if self.position_side == 'SELL' else 'NONE'} mode={self.current_mode}")
-                    last_heartbeat = time.time()
-
+                loop_c += 1
+                if time.time() - last_h >= 60:
+                    if self.current_indicators:
+                        ind = self.current_indicators
+                        logger.info(f"[HEARTBEAT] loop={loop_c} price=${self.latest_btc_price} pos={self.position_side or 'NONE'} | EMA={ind['ema']:.0f} ADX={ind['adx']:.1f} RSI={ind['rsi']:.1f}")
+                    else:
+                        logger.info(f"[HEARTBEAT] loop={loop_c} price=${self.latest_btc_price} pos={self.position_side or 'NONE'}")
+                    last_h = time.time()
+                    
                 self._check_session()
                 if self.session_data.get("status") == "STOPPED":
-                    time.sleep(60)
-                    continue
-
-                current_price = self.latest_btc_price
-                if current_price is None:
-                    time.sleep(1)
-                    continue
-
-                if time.time() - self.last_macro_fetch > CONFIG["macro_fetch_interval"]:
-                    self._fetch_macro_schedule()
-
-                synced = self._sync_position()
-                self._reconcile_position(synced)
-
-                is_holding = self._manage_position(current_price)
-
+                    time.sleep(60); continue
+                cur_p = self.latest_btc_price
+                if cur_p is None: time.sleep(1); continue
+                if time.time() - self.last_macro_fetch > CONFIG["macro_fetch_interval"]: self._fetch_macro_schedule()
+                
+                # ポジションの同期
+                self._reconcile_position(self._sync_position())
+                
+                # 【絶対防衛ライン】API反映の完全な非同期ロック
+                if self.is_sync_pending:
+                    if self.position_side:
+                        # ポジションが反映されたらロック解除
+                        self.is_sync_pending = False
+                        self.entry_fail_count = 0
+                        self._send_email(f"【SoDEX v3.4.0】{self.position_side} 約定確認", f"API上でポジションの反映を確認しました。\n価格: ${self.last_entry_price}\nサイズ: {self.current_size} BTC")
+                    elif time.time() - self.sync_pending_since > 60:
+                        # 60秒待っても反映されなければ、未約定（キャンセル等）と見なしてロック解除
+                        self.is_sync_pending = False
+                        self.entry_fail_count += 1
+                        logger.warning(f"ENTRY NOT FILLED ({self.entry_fail_count}/3): 60秒経過してもAPI上に反映されません。未約定と判断しロックを解除します。")
+                        
+                        if self.entry_fail_count >= 3:
+                            logger.critical("SESSION STOPPED: 連続未約定による無限ループ防止機能が作動しました。")
+                            self._send_email("【SoDEX v3.4.0】緊急停止: 注文検知失敗", "3回連続で約定確認に失敗しました。無限エントリーを防ぐため停止します。至急手動確認を行ってください。")
+                            self.session_data["status"] = "STOPPED"
+                            self._save_session_data()
+                            self.entry_fail_count = 0
+                    else:
+                        # まだ60秒経っていない場合は、ここでループをスキップ（次の注文は物理的に不可能）
+                        logger.info(f"APIのポジション反映を待機中... (経過: {int(time.time() - self.sync_pending_since)}秒)")
+                        time.sleep(5)
+                        continue
+                
+                # ロック中でなければ通常のポジション管理
+                is_holding = self._manage_position(cur_p)
                 if not is_holding:
-                    cooldown_elapsed = time.time() - self.last_close_time
-                    cooldown_required = CONFIG["cooldown_minutes"] * 60
-                    if cooldown_elapsed >= cooldown_required:
-                        signal = self._analyze(current_price)
-                        if signal != "WAIT":
-                            stop_distance = self.current_atr * CONFIG["stop_loss_atr_mult"] if self.current_atr else 0
-                            size = self._calculate_position_size(stop_distance)
+                    if time.time() - self.last_close_time >= CONFIG["cooldown_minutes"] * 60:
+                        sig = self._analyze(cur_p)
+                        if sig != "WAIT":
+                            if self._place_order(sig, cur_p, self._calculate_position_size(self.current_atr * CONFIG["stop_loss_atr_mult"] if self.current_atr else 0)):
+                                # 注文成功時、絶対にロック状態に移行する
+                                self.is_sync_pending = True
+                                self.sync_pending_since = time.time()
+                                logger.info("注文送信完了。APIへの反映待機（絶対ロック）状態に移行します。")
+                                time.sleep(3) 
 
-                            if self._place_order(signal, current_price, size):
-                                time.sleep(2)
-                                post_entry_sync = self._sync_position()
-                                if post_entry_sync:
-                                    logger.info(f"ENTRY CONFIRMED: {post_entry_sync['side']} @ ${post_entry_sync['entry']:.2f} ({post_entry_sync['size']} BTC)")
-                                    self._reconcile_position(post_entry_sync)
-                                else:
-                                    logger.warning("ENTRY: 注文送信済みだがポジション未反映 → 次ループで再確認")
-            except Exception as e:
-                logger.error(f"ループ例外: {e}", exc_info=True)
-            
+            except Exception as e: logger.error(f"例外: {e}", exc_info=True)
             time.sleep(5)
 
 if __name__ == "__main__":
-    required_envs = ["SODEX_API_KEY", "SODEX_PRIVATE_KEY", "SODEX_ACCOUNT_ID"]
-    missing = [k for k in required_envs if not os.getenv(k)]
+    required_env = ["SODEX_API_KEY", "SODEX_PRIVATE_KEY", "SODEX_ACCOUNT_ID"]
+    missing = [k for k in required_env if not os.getenv(k)]
     if missing:
-        raise RuntimeError(f"必須環境変数が未設定です。'.env'ファイルを確認してください: {', '.join(missing)}")
-
-    API_KEY = os.getenv("SODEX_API_KEY")
-    PRIVATE_KEY = os.getenv("SODEX_PRIVATE_KEY")
-    ACCOUNT_ID = int(os.getenv("SODEX_ACCOUNT_ID"))
-    WALLET_ADDR = os.getenv("SODEX_WALLET_ADDRESS", "")
-    IS_TESTNET = os.getenv("SODEX_TESTNET", "false").lower() == "true"
+        raise RuntimeError(f"起動エラー: 必須の環境変数が設定されていません -> {missing}")
 
     bot = SodexAdvancedBotV2(
-        api_key=API_KEY,
-        private_key_hex=PRIVATE_KEY,
-        account_id=ACCOUNT_ID,
-        wallet_address=WALLET_ADDR if WALLET_ADDR else None,
-        is_testnet=IS_TESTNET,
+        api_key=os.getenv("SODEX_API_KEY"), 
+        private_key_hex=os.getenv("SODEX_PRIVATE_KEY"), 
+        account_id=int(os.getenv("SODEX_ACCOUNT_ID")), 
+        wallet_address=os.getenv("SODEX_WALLET_ADDRESS"), 
+        is_testnet=os.getenv("SODEX_TESTNET", "false").lower() == "true"
     )
     bot.run_strategy()
