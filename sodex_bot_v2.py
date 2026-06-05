@@ -4,7 +4,6 @@ import json
 import uuid
 import threading
 import websocket
-import smtplib
 import csv
 import math
 import logging
@@ -12,14 +11,13 @@ import pytz
 import os
 import sys
 from datetime import datetime, timezone, timedelta, time as dtime
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from eth_account import Account
 import pandas as pd
 from ta.trend import EMAIndicator, ADXIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from web3 import Web3
+from eth_keys import keys
 from collections import OrderedDict
 from dotenv import load_dotenv
 from pathlib import Path
@@ -39,7 +37,11 @@ logging.basicConfig(
         logging.StreamHandler(),
     ],
 )
-logger = logging.getLogger("SoDEX_OMS_v3.5.0")
+logger = logging.getLogger("SoDEX_OMS_v4.2.1")
+
+PAPER_TRADE = os.getenv("PAPER_TRADE", "True").lower() == "true"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 ORDER_SIDE_BUY = 1
 ORDER_SIDE_SELL = 2
@@ -57,8 +59,6 @@ CONFIG = {
     "max_size": 0.002, 
     "fallback_size": 0.002,
     "kline_interval": "5m",
-    
-    # テクニカル設定
     "rsi_period": 14,
     "adx_period": 14,
     "ema_period": 50,
@@ -66,8 +66,6 @@ CONFIG = {
     "bb_std_dev": 2,
     "atr_period": 14,
     "volume_sma_period": 20,
-    
-    # 🎯 エントリー設定
     "trend_rsi_buy_max": 55,
     "trend_rsi_sell_min": 45,
     "trend_adx_min": 28,
@@ -75,8 +73,6 @@ CONFIG = {
     "min_score_to_enter_scalp": 4,
     "scalp_rsi_buy_max": 35,
     "scalp_rsi_sell_min": 65,
-    
-    # 🎯 決済設定
     "take_profit_atr_mult": 2.0,
     "stop_loss_atr_mult": 1.5,
     "tp_cap_pct_trend": 0.015,
@@ -84,34 +80,25 @@ CONFIG = {
     "sl_cap_pct": 0.008,
     "secure_trigger_atr_mult": 2.5,
     "secure_floor_atr_mult": 1.2,
-    
-    # 🎯 ダイナミックリスク設定
     "risk_per_trade_base": 0.02,
     "risk_dvol_high": 0.005,
     "dvol_threshold": 75,
     "dvol_extreme": 85,
     "dvol_api_url": "https://www.deribit.com/api/v2/public/get_index_price?index_name=btcdvol_usdc",
-    
     "volume_filter_mult": 1.0,
     "funding_rate_threshold": 0.01,
     "oi_change_threshold": 0.03,
     "book_imbalance_threshold": 0.6,
-    
     "max_loss_per_session": 15.0,
     "cooldown_minutes": 15,
     "lockout_minutes": 90,
     "force_close_slippages": [0.01, 0.03, 0.05],
     "force_close_confirm_wait": 3,
     "force_close_confirm_checks": 10,
-    
-    # 🚨 新規: 検疫期間 (Ghost Fill 対策)
     "settlement_quarantine_seconds": 10, 
-    
     "macro_filter_enabled": True,
     "macro_api_url": "https://openapi.sosovalue.com/openapi/v1/macro/events",
     "macro_fetch_interval": 86400,
-    "gmail_user": os.getenv("GMAIL_USER", ""),
-    "gmail_pass": os.getenv("GMAIL_PASSWORD", ""),
 }
 
 TAKER_FEE_RATE = 0.0005
@@ -209,6 +196,7 @@ def compute_indicators(df: pd.DataFrame, cfg: dict) -> dict | None:
         logger.error(f"指標計算エラー: {e}")
         return None
 
+
 class SodexAdvancedBotV2:
     def __init__(self, api_key: str, private_key_hex: str, account_id: int,
                  wallet_address: str = None, is_testnet: bool = False):
@@ -223,8 +211,14 @@ class SodexAdvancedBotV2:
 
         self.api_key = api_key
         self.account_id = account_id
-        self.private_key = private_key_hex
-        self.account = Account.from_key(private_key_hex)
+
+        # ======================================================================
+        # ─── 【v4.2.1 確定版署名エンジン】公式APIキーの秘密鍵を直接使用 ───
+        # ======================================================================
+        self.private_key_hex = private_key_hex.replace("0x", "")
+        self.private_key = bytes.fromhex(self.private_key_hex)
+        self.account = Account.from_key(self.private_key)
+        self._signing_key = keys.PrivateKey(self.private_key)
         self.wallet_address = (wallet_address or self.account.address).lower()
 
         if is_testnet:
@@ -236,17 +230,34 @@ class SodexAdvancedBotV2:
             self.ws_url = "wss://mainnet-gw.sodex.dev/ws/perps"
             self.chain_id = 286623
 
+        # ======================================================================
+        # ─── 【v4.2.1】EIP-712 ドメイン定数の事前計算（不変） ───
+        # ======================================================================
+        _keccak = lambda b: Web3.keccak(b)
+        self._domain_separator = _keccak(
+            _keccak(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+            + _keccak(b"futures")
+            + _keccak(b"1")
+            + self.chain_id.to_bytes(32, 'big')
+            + bytes(32)
+        )
+        self._action_type_hash = _keccak(
+            b"ExchangeAction(bytes32 payloadHash,uint64 nonce)"
+        )
+
+        # ======================================================================
+        # ─── セッション設定（認証ヘッダーは発注時に個別付与） ───
+        # ======================================================================
         self._sodex = requests.Session()
         self._sodex.headers.update({
             "Accept": "application/json",
-            "User-Agent": "SoDEX-OMS/3.5.0",
-            "X-API-Key": self.api_key,
+            "User-Agent": "SoDEX-OMS/4.2.1",
         })
 
         self._public = requests.Session()
         self._public.headers.update({
             "Accept": "application/json",
-            "User-Agent": "SoDEX-OMS/3.5.0",
+            "User-Agent": "SoDEX-OMS/4.2.1",
         })
 
         self.latest_btc_price = None
@@ -254,7 +265,6 @@ class SodexAdvancedBotV2:
         self.last_close_time = 0
         self.sync_mismatch_count = 0
         
-        # 🚨 OMS State Machine Variables
         self.state = "FLAT" 
         self.pending_order_time = 0
         self.cancel_wait_start = 0
@@ -293,159 +303,222 @@ class SodexAdvancedBotV2:
 
         init_trade_log()
 
+        self.last_heartbeat_export = 0
+        self.last_event = {
+            "type": "🚀 SYSTEM_START", 
+            "message": "SoDEX OMS initialized.",
+            "timestamp": datetime.now(pytz.UTC).isoformat()
+        }
+
         logger.info("=" * 60)
-        logger.info("  SoDEX OMS v3.5.0 - INSTITUTIONAL EXECUTION EDITION")
+        logger.info("  SoDEX OMS v4.2.1 - 署名配列＆型防御完全適合版")
         logger.info(f"  ネットワーク: {'TESTNET' if is_testnet else 'MAINNET'}")
+        logger.info(f"  APIキー名: {self.api_key}")
+        logger.info(f"  署名アドレス: {self.account.address}")
         logger.info(f"  ウォレット: {self.wallet_address}")
         logger.info("=" * 60)
 
-    # 🚨 1. 絶対防衛 (Reactive Kill Switch)
-    def _trigger_panic_lock(self, current_price: float, reason: str):
-        logger.critical(f"🚨🚨 PANIC SEQUENCE INITIATED: {reason} 🚨🚨")
-        with open(PANIC_LOCK_FILE, "w") as f:
-            f.write(f"PANIC TRIGGERED AT: {datetime.now(timezone.utc).isoformat()}\nREASON: {reason}")
-            
-        self._cancel_all_orders()
-        self._force_close(current_price, f"EMERGENCY FLATTEN ({reason})")
-        
-        self.state = "PANIC"
-        self._send_email("【緊急停止】SoDEX OMS v3.5.0", f"致命的な異常を検知したため、panic.lockを生成し完全停止しました。\n理由: {reason}")
-        logger.critical("🚨 システムを安全に停止しました。手動介入が必要です。")
+    # ==========================================================================
+    # ─── 【v4.2.1 修正】キー挿入順を完全保持するEIP-712署名エンジン ───
+    # ==========================================================================
+    def _generate_eip712_signature(self, params, nonce: int, action_type: str = "newOrder") -> str:
+        """
+        ソートなし・挿入順シリアライズを厳格執行する署名生成
+        """
+        _keccak = Web3.keccak
 
-    # 🚨 2. Invariant チェック (事後検知)
-    def _check_exposure_invariant(self, current_price: float, synced_data: dict | None) -> bool:
-        exchange_size = synced_data["size"] if synced_data else 0.0
-        if exchange_size > CONFIG["max_size"] * 1.1:
-            self._trigger_panic_lock(current_price, f"Hard Exposure Cap 超過 (Exchange: {exchange_size} BTC > Max: {CONFIG['max_size']} BTC)")
-            return False
+        # 🎯 絶対防衛線: 標準json.dumpsによる自動キー並び替えを完全物理排除
+        action = {"type": action_type, "params": params}
+        action_str = json.dumps(action, separators=(",", ":"))
+        payload_hash = _keccak(action_str.encode("utf-8"))
 
-        if self.state in ["FLAT", "IN_POSITION"]:
-            local_size = self.current_size if self.state == "IN_POSITION" else 0.0
-            drift = abs(local_size - exchange_size)
-            if drift > 0:
-                logger.error(f"⚠️ EXPOSURE DRIFT DETECTED: Local={local_size} BTC, Exchange={exchange_size} BTC, Drift={drift} BTC")
-                if drift >= CONFIG["min_size"]:
-                    self._trigger_panic_lock(current_price, f"致命的なポジション乖離 (Drift: {drift} BTC)")
-                    return False
-        return True
+        # messageHash
+        message_hash = _keccak(
+            bytes(self._action_type_hash)
+            + bytes(payload_hash)
+            + nonce.to_bytes(32, "big")
+        )
 
-    # 🚨 3. Pre-Trade Risk Engine (事前抑止)
-    def _get_effective_exposure(self) -> float:
-        try:
-            res = self._sodex.get(
-                f"{self.rest_url}/accounts/{self.wallet_address}/state", 
-                params={"accountID": self.account_id, "t": int(time.time() * 1000)},
-                timeout=5
-            ).json()
-            data = res.get("data", {})
-            
-            # 1. ライブポジションサイズの計算
-            positions = data.get("P", []) or data.get("positions", [])
-            live_size = 0.0
-            base_asset = CONFIG["symbol"].split("-")[0]
-            
-            for p in positions:
-                symbol = str(p.get("s", p.get("symbol", "")))
-                if symbol == CONFIG["symbol"] or symbol == base_asset:
-                    live_size += abs(float(p.get("sz", p.get("size", p.get("positionAmt", 0))) or 0))
-            
-            # 2. 未約定注文の厳密な残量計算
-            open_orders = data.get("orders", []) or []
-            outstanding_size = 0.0
-            
-            for o in open_orders:
-                is_reduce_only = o.get("reduceOnly", False) or o.get("ro", False)
-                if not is_reduce_only:
-                    original_qty = float(o.get("q", o.get("quantity", 0)) or 0)
-                    filled_qty = float(o.get("f", o.get("filledQty", o.get("executedQty", 0))) or 0)
-                    remaining = max(0.0, original_qty - filled_qty)
-                    outstanding_size += remaining
-            
-            effective_exp = live_size + outstanding_size
-            if effective_exp > 0:
-                logger.info(f"[RISK ENGINE] Effective Exposure: {effective_exp:.4f} BTC (Live: {live_size:.4f}, Pending: {outstanding_size:.4f})")
-                
-            return effective_exp
-            
-        except Exception as e:
-            logger.error(f"[RISK ENGINE] Effective Exposure 取得エラー(Fail Safe): {e}")
-            return float('inf') # 安全側に倒す
+        # finalHash
+        final_hash = _keccak(
+            b"\x19\x01"
+            + bytes(self._domain_separator)
+            + bytes(message_hash)
+        )
+
+        # ECDSA署名
+        signed = self._signing_key.sign_msg_hash(final_hash)
+        r_bytes = int(signed.r).to_bytes(32, "big")
+        s_bytes = int(signed.s).to_bytes(32, "big")
+        v_recovery = int(signed.v).to_bytes(1, "big")
+
+        return "0x01" + (r_bytes + s_bytes + v_recovery).hex()
+
+    def _build_signed_headers(self, params, nonce: int, action_type: str = "newOrder") -> dict:
+        signature = self._generate_eip712_signature(params, nonce, action_type)
+        return {
+            "content-type": "application/json",
+            "x-api-key": self.api_key,
+            "x-api-sign": signature,
+            "x-api-nonce": str(nonce),
+        }
 
     def _reset_local_state(self):
         self.position_side = None
-        self.last_entry_price = None
+        self.last_entry_price = 0.0
+        self.current_size = 0.0
         self.is_profit_secured = False
-        self.state = "FLAT"
         self.mfe = 0.0
         self.mae = 0.0
+        self.entry_timestamp = 0
         self.entry_mode = None
         self.entry_atr = None
         self.entry_dvol = None
         self.entry_rsi = None
         self.entry_adx = None
-        self.current_size = 0.0
-        self.entry_timestamp = 0
         self.penalty_time = 0
 
-    def _send_email(self, subject: str, text: str, is_html: bool = False):
-        if not CONFIG["gmail_user"] or not CONFIG["gmail_pass"]: return
-        threading.Thread(target=self._send_email_sync, args=(subject, text, is_html), daemon=True).start()
-
-    def _send_email_sync(self, subject: str, text: str, is_html: bool = False):
-        try:
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = subject
-            msg["From"] = CONFIG["gmail_user"]
-            msg["To"] = CONFIG["gmail_user"]
-            msg.attach(MIMEText(text, "html" if is_html else "plain", "utf-8"))
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-                server.login(CONFIG["gmail_user"], CONFIG["gmail_pass"])
-                server.send_message(msg)
-        except Exception: pass
-
-    def _send_settlement_report(self, pos_info: dict, exit_price: float, reason: str):
-        side = pos_info["side"]
-        entry = pos_info["entry"]
-        size = pos_info["size"]
-        pnl_usd = (exit_price - entry) * size if side == "BUY" else (entry - exit_price) * size
-        pnl_pct = (exit_price - entry) / entry if side == "BUY" else (entry - exit_price) / entry
-        roe = pnl_pct * CONFIG["leverage"] * 100
-        color = "#2ecc71" if roe > 0 else "#e74c3c"
-        subject = f"【SoDEX OMS v3.5.0】{'利確' if roe > 0 else '損切'}完了 ({side})"
-        html = f"""<div style="font-family: sans-serif; padding: 20px; border: 1px solid #eee;"><h2 style="color: {color}; border-bottom: 2px solid;">{reason} 実行報告</h2><table style="width: 100%; border-collapse: collapse;"><tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><b>方向 / サイズ</b></td><td style="text-align: right;">{side} ({size} BTC)</td></tr><tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><b>エントリー建値</b></td><td style="text-align: right;">${int(entry)}</td></tr><tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><b>決済価格</b></td><td style="text-align: right;">${int(exit_price)}</td></tr><tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-size: 1.2em;"><b>損益 (ROE)</b></td><td style="text-align: right; color: {color}; font-size: 1.2em;"><b>{roe:+.2f}% (${pnl_usd:+.2f})</b></td></tr></table></div>"""
-        self._send_email(subject, html, is_html=True)
-
-    def _get_session_id(self) -> str:
-        now = datetime.now(timezone.utc)
-        h = now.hour
-        d = now.strftime("%Y-%m-%d")
-        if 6 <= h < 18: return f"{d}_DAY"
-        if h < 6: return f"{d}_EARLY_MORNING"
-        return f"{d}_NIGHT"
-
     def _load_session_data(self) -> dict:
-        if os.path.exists(SESSION_LOG_FILE):
-            try:
+        try:
+            if os.path.exists(SESSION_LOG_FILE):
                 with open(SESSION_LOG_FILE, "r") as f:
-                    return json.load(f)
-            except Exception: pass
-        return {"currentSession": self._get_session_id(), "totalLoss": 0, "status": "ACTIVE"}
+                    data = json.load(f)
+                    if data.get("date") == datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+                        return data
+        except Exception: pass
+        return {"date": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "totalLoss": 0.0, "status": "ACTIVE", "recent_results": []}
 
     def _save_session_data(self):
-        temp_file = str(SESSION_LOG_FILE) + ".tmp"
-        with open(temp_file, "w") as f:
-            json.dump(self.session_data, f, indent=2)
-        os.replace(temp_file, SESSION_LOG_FILE)
+        try:
+            with open(SESSION_LOG_FILE, "w") as f:
+                json.dump(self.session_data, f)
+        except Exception: pass
 
     def _check_session(self):
-        now_id = self._get_session_id()
-        if self.session_data.get("currentSession") != now_id:
-            old_recent = self.session_data.get("recent_results", [])
-            self.session_data = {"currentSession": now_id, "totalLoss": 0, "status": "ACTIVE", "recent_results": old_recent[-5:]}
-            self._save_session_data()
-            self.consecutive_loss = {"BUY": 0, "SELL": 0}
-            self.lockout_time = {"BUY": 0, "SELL": 0}
-            logger.info(f"新セッション開始: {now_id} (記憶引継ぎ完了)")
+        if self.session_data.get("status") == "STOPPED":
+            logger.critical("SESSION STOPPED. 自動取引を停止しています。")
+            time.sleep(60)
+
+    def _send_settlement_report(self, position: dict, exit_price: float, reason: str):
+        side = position["side"]
+        entry = position["entry"]
+        size = position["size"]
+        pnl = (exit_price - entry if side == "BUY" else entry - exit_price) * size
+        notional = exit_price * size
+        fee = notional * TAKER_FEE_RATE * 2
+        net_pnl = pnl - fee
+        roe = ((exit_price - entry) / entry if side == "BUY" else (entry - exit_price) / entry) * 100 * CONFIG["leverage"]
+        emoji = "🟢" if net_pnl >= 0 else "🔴"
+        msg = (
+            f"{emoji} *決済完了*\n"
+            f"方向: `{side}` | 理由: `{reason}`\n"
+            f"参入: `${entry:,.2f}` → 決済: `${exit_price:,.2f}`\n"
+            f"数量: `{size} BTC`\n"
+            f"損益: `${net_pnl:+.2f}` (ROE: `{roe:+.2f}%`)"
+        )
+        self.send_telegram(msg)
+        self.last_event = {"type": f"{emoji} SETTLEMENT", "message": msg, "timestamp": datetime.now(pytz.UTC).isoformat()}
+        self.export_metrics(event_name="SETTLEMENT")
+
+    def _check_exposure_invariant(self, current_price: float, synced: dict | None) -> bool:
+        if synced and synced["size"] > CONFIG["max_size"] * 2.0:
+            logger.critical(f"🚨 EXPOSURE INVARIANT VIOLATION: size={synced['size']} > max*2={CONFIG['max_size']*2}")
+            self._trigger_panic_lock(current_price, f"Exposure Invariant Violation: {synced['size']} BTC")
+            return False
+        return True
+
+    def _get_effective_exposure(self) -> float:
+        try:
+            res_raw = self._sodex.get(
+                f"{self.rest_url}/accounts/{self.wallet_address}/state",
+                params={"accountID": self.account_id, "t": int(time.time() * 1000)},
+                timeout=5
+            )
+            if not res_raw or not isinstance(res_raw.json(), dict): return self.current_size
+            res = res_raw.json()
+            total = 0.0
+            for p in res.get("data", {}).get("P", []) or res.get("data", {}).get("positions", []):
+                total += abs(float(p.get("sz", p.get("size", p.get("positionAmt", 0))) or 0))
+            open_orders = res.get("data", {}).get("orders", []) or []
+            for o in open_orders:
+                total += abs(float(o.get("qty", o.get("quantity", o.get("origQty", 0))) or 0))
+            return total
+        except Exception:
+            return self.current_size
+
+    def export_metrics(self, event_name="HEARTBEAT"):
+        try:
+            indicators = self.current_indicators or {}
+            current_side = getattr(self, "position_side", "NONE")
+            if not current_side: current_side = "NONE"
+
+            metrics = {
+                "timestamp": datetime.now(pytz.UTC).isoformat(),
+                "event": event_name,
+                "last_event": getattr(self, "last_event", {}),
+                "oms": {
+                    "state": getattr(self, "state", "UNKNOWN"),
+                    "position_side": current_side,
+                    "size": getattr(self, "current_size", 0.0),
+                    "entry_price": getattr(self, "last_entry_price", 0.0),
+                    "pending_cl_ord_id": getattr(self, "pending_cl_ord_id", None),
+                },
+                "risk": {
+                    "panic_lock": os.path.exists(PANIC_LOCK_FILE),
+                    "sync_mismatch_count": getattr(self, "sync_mismatch_count", 0),
+                    "profit_secured": getattr(self, "is_profit_secured", False),
+                },
+                "execution": {
+                    "last_fill_delay_sec": getattr(self, "last_fill_delay", 0.0),
+                    "ws_connected": bool(
+                        self._ws and 
+                        self._ws.sock and 
+                        self._ws.sock.connected
+                    ),
+                },
+                "market": {
+                    "price": getattr(self, "latest_btc_price", 0.0),
+                    "mode": getattr(self, "current_mode", "UNKNOWN"),
+                    "dvol": getattr(self, "current_dvol", 50.0),
+                    "ema": indicators.get("ema", 0.0),
+                    "adx": indicators.get("adx", 0.0),
+                    "rsi": indicators.get("rsi", 0.0),
+                }
+            }
+
+            tmp_file = BASE_DIR / "bot_status.tmp"
+            json_file = BASE_DIR / "bot_status.json"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(metrics, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_file, json_file)
+        except Exception as e:
+            logger.error(f"Metrics Export Error: {e}")
+
+    def send_telegram(self, message: str):
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            logger.error("⚠️ TelegramのトークンまたはChat IDが読み込めていません！.envを確認してください。")
+            return
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        try:
+            res = requests.post(url, data=data, timeout=5)
+            if res.status_code != 200:
+                logger.error(f"⚠️ Telegram API 拒否エラー: HTTP {res.status_code} - {res.text}")
+            else:
+                logger.info("📩 Telegram通知の送信に成功しました！")
+        except Exception as e:
+            logger.error(f"Telegram通信エラー: {e}")
+
+    def _trigger_panic_lock(self, current_price: float, reason: str):
+        logger.critical(f"🚨🚨 PANIC SEQUENCE INITIATED: {reason} 🚨🚨")
+        with open(PANIC_LOCK_FILE, "w") as f:
+            f.write(f"PANIC TRIGGERED AT: {datetime.now(timezone.utc).isoformat()}\nREASON: {reason}\nPRICE: {current_price}\n")
+        self.send_telegram(f"🚨🚨🚨 *PANIC LOCK ACTIVATED*\n理由: `{reason}`\n価格: `${current_price:,.2f}`\n\n⚠️ 手動確認が必要です。")
+        self.state = "PANIC"
 
     def _record_pnl(self, side: str, pnl_usd: float, exit_price: float, reason: str):
         notional = exit_price * self.current_size
@@ -485,16 +558,28 @@ class SodexAdvancedBotV2:
                 logger.warning(f"LOCKOUT: {side}方向 {CONFIG['lockout_minutes']}分間停止")
             if self.session_data["totalLoss"] >= CONFIG["max_loss_per_session"]:
                 self.session_data["status"] = "STOPPED"
-                self._send_email("【SoDEX OMS】セッション最大損失超過", f"累計損失: ${self.session_data['totalLoss']:.2f}\nBot停止")
+                self.send_telegram(f"💀 *セッション最大損失超過*\n累計損失: `${self.session_data['totalLoss']:.2f}`\nBotを停止します。")
                 logger.critical("SESSION STOPPED: 最大損失超過")
             self._save_session_data()
         else:
             self.consecutive_loss[side] = 0
             self.penalty_time = 0
 
+    # ==========================================================================
+    # ─── 【v4.2.1 修正】API文字列レスポンスに対する完全防御 ───
+    # ==========================================================================
     def _sync_position(self) -> dict | None:
         try:
-            res = self._sodex.get(f"{self.rest_url}/accounts/{self.wallet_address}/state", params={"accountID": self.account_id, "t": int(time.time() * 1000)}, timeout=5).json()
+            res_raw = self._sodex.get(
+                f"{self.rest_url}/accounts/{self.wallet_address}/state", 
+                params={"accountID": self.account_id, "t": int(time.time() * 1000)}, 
+                timeout=5
+            )
+            # 🎯 絶対防衛線: 返り値が正常な辞書型オブジェクト(dict)である場合のみパースを許可
+            if not res_raw or not isinstance(res_raw.json(), dict):
+                return None
+                
+            res = res_raw.json()
             base_asset = CONFIG["symbol"].split("-")[0]
             for p in res.get("data", {}).get("P", []) or res.get("data", {}).get("positions", []):
                 symbol = str(p.get("s", p.get("symbol", "")))
@@ -503,7 +588,8 @@ class SodexAdvancedBotV2:
                 if (symbol == CONFIG["symbol"] or symbol == base_asset) and abs(size) > 0:
                     return {"side": "BUY" if size > 0 else "SELL", "entry": entry, "size": abs(size)}
             return None
-        except Exception: return None
+        except Exception: 
+            return None
 
     def _reconcile_position(self, synced: dict | None):
         if synced:
@@ -533,12 +619,28 @@ class SodexAdvancedBotV2:
                     self.sync_mismatch_count = 0
 
     def _cancel_all_orders(self) -> bool:
+        if not self.pending_cl_ord_id:
+            return True
         try:
             nonce = int(time.time() * 1000)
-            body = OrderedDict([("accountID", self.account_id), ("symbolID", CONFIG["symbol_id"])])
-            headers = {"Content-Type": "application/json", "X-API-Sign": self._generate_eip712_signature(body, nonce), "X-API-Nonce": str(nonce)}
-            self._sodex.delete(f"{self.rest_url}/trade/orders", headers=headers, data=json.dumps(body, separators=(',', ':')), timeout=5)
-            logger.info("❌ 未約定の注文 (Stale Order) をキャンセルしました。")
+            params = {
+                "accountID": self.account_id,
+                "cancels": [
+                    {
+                        "symbolID": CONFIG["symbol_id"],
+                        "clOrdID": self.pending_cl_ord_id
+                    }
+                ]
+            }
+            headers = self._build_signed_headers(params, nonce, action_type="cancelOrder")
+            body_json = json.dumps(params, separators=(",", ":"))
+            self._sodex.delete(
+                f"{self.rest_url}/trade/orders",
+                headers=headers,
+                data=body_json,
+                timeout=5
+            )
+            logger.info(f"❌ 注文 (ID: {self.pending_cl_ord_id}) をキャンセルしました。")
             return True
         except Exception as e:
             logger.error(f"キャンセルリクエストエラー: {e}")
@@ -571,7 +673,9 @@ class SodexAdvancedBotV2:
         api_key = os.getenv("SOSOVALUE_API_KEY", "")
         if not api_key: return
         try:
-            res = self._public.get(CONFIG["macro_api_url"], headers={"x-soso-api-key": api_key}, timeout=10).json()
+            res_raw = self._public.get(CONFIG["macro_api_url"], headers={"x-soso-api-key": api_key}, timeout=10)
+            if not res_raw or not isinstance(res_raw.json(), dict): return
+            res = res_raw.json()
             today_utc = datetime.now(self.UTC)
             target_dates = {today_utc.strftime("%Y-%m-%d"), (today_utc - timedelta(days=1)).strftime("%Y-%m-%d")}
             self.macro_events.clear()
@@ -609,7 +713,9 @@ class SodexAdvancedBotV2:
         now = time.time()
         if now - self.last_dvol_fetch < 15 * 60: return self.current_dvol
         try:
-            res = self._public.get(CONFIG["dvol_api_url"], params={"t": int(time.time() * 1000)}, timeout=5).json()
+            res_raw = self._public.get(CONFIG["dvol_api_url"], params={"t": int(time.time() * 1000)}, timeout=5)
+            if not res_raw or not isinstance(res_raw.json(), dict): return self.current_dvol
+            res = res_raw.json()
             if "result" in res and "index_price" in res["result"]:
                 self.current_dvol = float(res["result"]["index_price"])
                 self.last_dvol_fetch = now
@@ -620,7 +726,9 @@ class SodexAdvancedBotV2:
         now = time.time()
         if self.current_indicators and now - self.last_indicator_fetch < 20: return self.current_indicators
         try:
-            res = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/klines", params={"interval": CONFIG["kline_interval"], "limit": 250, "t": int(time.time() * 1000)}, timeout=10).json()
+            res_raw = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/klines", params={"interval": CONFIG["kline_interval"], "limit": 250, "t": int(time.time() * 1000)}, timeout=10)
+            if not res_raw or not isinstance(res_raw.json(), dict): return None
+            res = res_raw.json()
             if res.get("code") == 0 and res.get("data"):
                 indicators = compute_indicators(pd.DataFrame(res["data"]), CONFIG)
                 if indicators:
@@ -633,24 +741,29 @@ class SodexAdvancedBotV2:
 
     def _get_orderbook(self) -> dict | None:
         try:
-            res = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/orderbook", params={"depth": 5, "t": int(time.time() * 1000)}, timeout=5).json()
+            res_raw = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/orderbook", params={"depth": 5, "t": int(time.time() * 1000)}, timeout=5)
+            if not res_raw or not isinstance(res_raw.json(), dict): return None
+            res = res_raw.json()
             if res.get("code") == 0 and res.get("data"):
                 book = res["data"]
-                bids, asks = book.get("bids", []), book.get("asks", [])
-                if bids and asks:
+                box_bids, box_asks = book.get("bids", []), book.get("asks", [])
+                if box_bids and box_asks:
                     parse_p = lambda e: float(e.get("price", e.get("p", 0))) if isinstance(e, dict) else float(e[0])
                     parse_q = lambda e: float(e.get("quantity", e.get("q", 0))) if isinstance(e, dict) else float(e[1])
-                    self.best_bid, self.best_ask = parse_p(bids[0]), parse_p(asks[0])
-                    bid_vol, ask_vol = sum(parse_q(b) for b in bids[:5]), sum(parse_q(a) for a in asks[:5])
+                    self.best_bid, self.best_ask = parse_p(box_bids[0]), parse_p(box_asks[0])
+                    bid_vol, ask_vol = sum(parse_q(b) for b in box_bids[:5]), sum(parse_q(a) for a in box_asks[:5])
                     return {"best_bid": self.best_bid, "best_ask": self.best_ask, "imbalance": bid_vol / (bid_vol + ask_vol) if (bid_vol + ask_vol) > 0 else 0.5}
-        except Exception: pass
+        except Exception as e: 
+            logger.error(f"❌ ORDERBOOK ERROR: 板情報の取得・解析に失敗しました: {e}")
         return None
 
     def _get_funding_rate(self) -> float:
         now = time.time()
         if now - self.last_funding_fetch < 5 * 60: return self.current_funding_rate
         try:
-            res = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/funding-rate", params={"t": int(time.time() * 1000)}, timeout=5).json()
+            res_raw = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/funding-rate", params={"t": int(time.time() * 1000)}, timeout=5)
+            if not res_raw or not isinstance(res_raw.json(), dict): return self.current_funding_rate
+            res = res_raw.json()
             if res.get("code") == 0 and res.get("data"):
                 self.current_funding_rate = float(res["data"].get("fundingRate", 0))
                 self.last_funding_fetch = now
@@ -662,7 +775,9 @@ class SodexAdvancedBotV2:
         if now - self.last_oi_fetch < 5 * 60:
             return (self.current_oi - self.previous_oi) / self.previous_oi if self.current_oi and self.previous_oi else None
         try:
-            res = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/open-interest", params={"t": int(time.time() * 1000)}, timeout=5).json()
+            res_raw = self._sodex.get(f"{self.rest_url}/markets/{CONFIG['symbol']}/open-interest", params={"t": int(time.time() * 1000)}, timeout=5)
+            if not res_raw or not isinstance(res_raw.json(), dict): return None
+            res = res_raw.json()
             if res.get("code") == 0 and res.get("data"):
                 self.previous_oi, self.current_oi = self.current_oi, float(res["data"].get("openInterest", 0))
                 self.last_oi_fetch = now
@@ -673,9 +788,11 @@ class SodexAdvancedBotV2:
     def _calculate_position_size(self, stop_loss_distance: float, risk_override: float = None) -> float:
         balance = 0.0
         try:
-            res = self._sodex.get(f"{self.rest_url}/accounts/{self.wallet_address}/state", params={"accountID": self.account_id, "t": int(time.time() * 1000)}, timeout=5).json()
-            if res.get("code") == 0 and res.get("data"):
-                balance = float(res["data"].get("availableMargin", res["data"].get("availableBalance", res["data"].get("marginBalance", 0))))
+            res_raw = self._sodex.get(f"{self.rest_url}/accounts/{self.wallet_address}/state", params={"accountID": self.account_id, "t": int(time.time() * 1000)}, timeout=5)
+            if res_raw and isinstance(res_raw.json(), dict):
+                res = res_raw.json()
+                if res.get("code") == 0 and res.get("data"):
+                    balance = float(res["data"].get("availableMargin", res["data"].get("availableBalance", res["data"].get("marginBalance", 0))))
         except Exception: pass
             
         if balance <= 0: return float(CONFIG["min_size"]) if CONFIG["min_size"] == CONFIG["max_size"] else 0.0
@@ -688,15 +805,6 @@ class SodexAdvancedBotV2:
         size = max(CONFIG["min_size"], min(CONFIG["max_size"], (balance * current_risk) / stop_loss_distance))
         return math.floor(size * 1000) / 1000
 
-    def _generate_eip712_signature(self, params: OrderedDict, nonce: int) -> str:
-        payload_json = json.dumps(OrderedDict([("type", "newOrder"), ("params", params)]), separators=(',', ':'), ensure_ascii=False)
-        keccak = lambda b: Web3.keccak(b)
-        domain_sep = keccak(keccak(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)") + keccak(b"futures") + keccak(b"1") + self.chain_id.to_bytes(32, 'big') + bytes(32))
-        struct_hash  = keccak(bytes(keccak(b"ExchangeAction(bytes32 payloadHash,uint64 nonce)")) + bytes(keccak(payload_json.encode('utf-8'))) + nonce.to_bytes(32, 'big'))
-        signed = self.account.unsafe_sign_hash(keccak(b'\x19\x01' + bytes(domain_sep) + bytes(struct_hash)))
-        sig_bytes = bytes.fromhex(signed.signature.hex()[2:])
-        return "0x01" + (sig_bytes[:-1] + bytes([sig_bytes[-1] - 27])).hex()
-
     def _place_order(self, side: str, base_price: float, size: float, is_close: bool = False, override_price: float = None) -> bool:
         self.last_order_time = time.time()
         book = self._get_orderbook()
@@ -705,42 +813,88 @@ class SodexAdvancedBotV2:
 
         if override_price is not None: 
             execute_price = int(round(override_price))
-            tif = TIF_IOC
         else:
-            if not is_close and dvol < 70 and adx < 35 and book:
-                execute_price = int(round(book["best_bid"] if side == "BUY" else book["best_ask"]))
-                tif = TIF_GTC
+            if not book or book.get("best_bid") is None or book.get("best_ask") is None:
+                logger.warning("⚠️ 板情報異常（NULL検知）。成行近似価格へフォールバックします")
+                execute_price = int(round(base_price * (1.005 if side == "BUY" else 0.995)))
             else:
-                execute_price = int(round(book["best_ask"] + 0.5 if side == "BUY" else book["best_bid"] - 0.5)) if book else int(round(base_price * (1.005 if side == "BUY" else 0.995)))
-                tif = TIF_IOC
+                execute_price = int(round(
+                    book["best_ask"] + 0.5 if side == "BUY" else book["best_bid"] - 0.5
+                ))
+        
+        tif = TIF_IOC  
 
         nonce = int(time.time() * 1000)
-        cl_ord_id = str(uuid.uuid4())[:36]
-        
-        if not is_close: self.pending_cl_ord_id = cl_ord_id
+        cl_ord_id = f"{self.account_id}-{nonce}"
+        if not is_close: 
+            self.pending_cl_ord_id = cl_ord_id
 
-        body = OrderedDict([("accountID", self.account_id), ("symbolID", CONFIG["symbol_id"]), ("orders", [OrderedDict([("clOrdID", cl_ord_id), ("modifier", MODIFIER_NORMAL), ("side", ORDER_SIDE_BUY if side == "BUY" else ORDER_SIDE_SELL), ("type", ORDER_TYPE_LIMIT), ("timeInForce", tif), ("price", str(execute_price)), ("quantity", str(size)), ("reduceOnly", is_close), ("positionSide", POSITION_SIDE_BOTH)])])])
-        headers = {"Content-Type": "application/json", "X-API-Sign": self._generate_eip712_signature(body, nonce), "X-API-Nonce": str(nonce)}
-        
+        order_side = ORDER_SIDE_BUY if side == "BUY" else ORDER_SIDE_SELL
+
+        # 🎯 昨夜、完全にメインネットを破壊した「キー挿入順」構造を厳密に定義
+        params = {
+            "accountID": self.account_id,
+            "symbolID": CONFIG["symbol_id"],
+            "orders": [
+                {
+                    "clOrdID": cl_ord_id,
+                    "modifier": MODIFIER_NORMAL,
+                    "side": order_side,
+                    "type": 2,
+                    "timeInForce": tif,
+                    "price": f"{execute_price}",
+                    "quantity": f"{size:.3f}",
+                    "reduceOnly": is_close,
+                    "positionSide": POSITION_SIDE_BOTH,
+                }
+            ]
+        }
+
+        body_json = json.dumps(params, separators=(",", ":"))
+        headers = self._build_signed_headers(params, nonce, action_type="newOrder")
+
+        logger.info(f"🚀 ORDER: {side} {'決済' if is_close else '新規'} {size} BTC @ ${execute_price} | nonce={nonce}")
+
+        if PAPER_TRADE:
+            logger.info(f"🥊 [PAPER TRADE] 仮想オーダー発射 | {side} {size} BTC @ ${execute_price}")
+            return True
+
         try:
-            # json()でいきなりパースせず、まずは生のレスポンスオブジェクトを受け取る
-            response = self._sodex.post(f"{self.rest_url}/trade/orders", headers=headers, data=json.dumps(body, separators=(',', ':')), timeout=10)
+            response = self._sodex.post(
+                f"{self.rest_url}/trade/orders",
+                headers=headers,
+                data=body_json,
+                timeout=10
+            )
+            logger.info(f"📨 HTTP {response.status_code} | {response.text[:200]}")
             
-            # JSONとしてパース
-            res = response.json()
+            try:
+                res = response.json()
+            except Exception:
+                logger.error(f"❌ INVALID JSON RESPONSE: {response.text[:100]}...")
+                return False
             
-            if res.get("code") == 0:
-                logger.info(f"ORDER SENT: {side} {'決済' if is_close else '新規'} {size} BTC @ ${execute_price}")
+            success_flag = True
+            order_id = "Unknown"
+            
+            res_data = res.get("data")
+            if isinstance(res_data, dict):
+                success_flag = res_data.get("success", True)
+                order_id = res_data.get("orderID", "Unknown")
+            elif isinstance(res_data, list) and len(res_data) > 0:
+                success_flag = (res_data[0].get("code", -1) == 0)
+                order_id = res_data[0].get("orderID", "Unknown")
+
+            if response.status_code == 200 and res.get("code") == 0 and success_flag:
+                logger.info(f"✅ ORDER SENT: {side} {size} BTC @ ${execute_price} | orderID={order_id}")
                 return True
             else:
-                # APIが0以外を返した場合：取引所調査用のヘッダーIDと生テキストを抽出して警告ログに出力
                 req_id = response.headers.get("X-Request-Id", response.headers.get("Trace-Id", "Unknown"))
-                logger.warning(f"⚠️ API ORDER REJECTED: {res.get('msg', 'Unknown Error')} (Code: {res.get('code')}) | ReqID: {req_id} | Raw: {response.text}")
-                
-        except Exception as e: 
-            logger.error(f"注文エラー: {e}")
-            
-        return False
+                logger.error(f"❌ API ORDER REJECTED | Code={res.get('code')} | Msg={res.get('msg')} | ReqID={req_id}")
+                return False
+        except Exception as e:
+            logger.exception(f"❌ 注文送信例外: {e}")
+            return False
 
     def _manage_position(self, current_price: float) -> bool:
         if not self.last_entry_price or not self.position_side: return False
@@ -830,7 +984,6 @@ class SodexAdvancedBotV2:
         ind = self._get_market_data()
         if not ind: return "WAIT"
 
-        # 🚨 ADXフィルター (死海での撤退)
         if ind["adx"] < 15:
             return "WAIT"
 
@@ -932,14 +1085,16 @@ class SodexAdvancedBotV2:
         while self.latest_btc_price is None:
             if time.time() - wait_start > 30:
                 try:
-                    res = self._public.get(f"{self.rest_url}/markets/tickers", params={"symbol": CONFIG["symbol"], "t": int(time.time() * 1000)}, timeout=5).json()
-                    data = res.get("data", [])
-                    if data: self.latest_btc_price = float(data[0].get("lastPx", 0))
+                    res_raw = self._public.get(f"{self.rest_url}/markets/tickers", params={"symbol": CONFIG["symbol"], "t": int(time.time() * 1000)}, timeout=5)
+                    if res_raw and isinstance(res_raw.json(), dict):
+                        data = res_raw.json().get("data", [])
+                        if data: self.latest_btc_price = float(data[0].get("lastPx", 0))
                 except Exception: pass
                 wait_start = time.time()
             time.sleep(1)
             
         logger.info(f"監視開始: ${self.latest_btc_price:.2f}")
+
         loop_c, last_h = 0, time.time()
         
         while True:
@@ -948,6 +1103,7 @@ class SodexAdvancedBotV2:
                 if time.time() - last_h >= 60:
                     ind = self.current_indicators
                     if ind: logger.info(f"[HEARTBEAT] loop={loop_c} price=${self.latest_btc_price} state={self.state} | EMA={ind['ema']:.0f} ADX={ind['adx']:.1f} RSI={ind['rsi']:.1f}")
+                    self.export_metrics(event_name="HEARTBEAT")
                     last_h = time.time()
                     
                 self._check_session()
@@ -958,13 +1114,11 @@ class SodexAdvancedBotV2:
                 self._get_market_data()
                 synced = self._sync_position()
 
-                # 🚨 絶対防衛の関所 (Reactive Invariant)
                 if self.state != "PANIC":
                     if not self._check_exposure_invariant(cur_p, synced):
                         time.sleep(10)
                         continue
 
-                # 💠 OMS State Machine 💠
                 if self.state == "FLAT":
                     if synced:
                         self._reconcile_position(synced)
@@ -977,7 +1131,6 @@ class SodexAdvancedBotV2:
                                     risk_override=getattr(self, 'current_dynamic_risk', None)
                                 )
                                 
-                                # 🚨 PRE_TRADE_CHECK: 実効露出の事前承認
                                 eff_exp = self._get_effective_exposure()
                                 if eff_exp + target_size > CONFIG["max_size"] * 1.05:
                                     logger.warning(f"🚫 [REJECT] Effective Exposure ({eff_exp:.4f} BTC) が超過。発注を拒否し残骸をパージします。")
@@ -998,9 +1151,9 @@ class SodexAdvancedBotV2:
                         self._reconcile_position(synced)
                         self.pending_cl_ord_id = None
                     else:
-                        timeout = 45
+                        timeout = 12  
                         if time.time() - self.pending_order_time > timeout:
-                            logger.warning(f"⏳ GTC Timeout ({timeout}秒). キャンセルを送信し WAIT_CANCEL へ移行します。")
+                            logger.warning(f"⏳ IOC Settlement Timeout ({timeout}秒). キャンセルを送信し WAIT_CANCEL へ移行します。")
                             self._cancel_all_orders()
                             self.state = "WAIT_CANCEL"
                             self.cancel_wait_start = time.time()
@@ -1013,19 +1166,25 @@ class SodexAdvancedBotV2:
                         continue
 
                     try:
-                        state_res = self._sodex.get(f"{self.rest_url}/accounts/{self.wallet_address}/state", params={"accountID": self.account_id, "t": int(time.time() * 1000)}, timeout=5).json()
-                        open_orders = state_res.get("data", {}).get("orders", []) or []
-                        is_still_alive = any(o.get("cl") == self.pending_cl_ord_id for o in open_orders)
-                        
-                        if not is_still_alive:
-                            logger.info("✅ 板からの消失を確認。ゴースト約定を警戒し SETTLEMENT_PENDING(検疫) へ移行します。")
-                            self.state = "SETTLEMENT_PENDING"
-                            self.settlement_start_time = time.time()
-                        else:
-                            if time.time() - self.cancel_wait_start > 30:
-                                logger.error("❌ 30秒経過しても板から消えません。再度キャンセルを送信します。")
-                                self._cancel_all_orders()
-                                self.cancel_wait_start = time.time()
+                        state_res_raw = self._sodex.get(f"{self.rest_url}/accounts/{self.wallet_address}/state", params={"accountID": self.account_id, "t": int(time.time() * 1000)}, timeout=5)
+                        if state_res_raw and isinstance(state_res_raw.json(), dict):
+                            state_res = state_res_raw.json()
+                            open_orders = state_res.get("data", {}).get("orders", []) or []
+                            
+                            is_still_alive = any(
+                                str(o.get("cl") or o.get("clOrdID") or o.get("clientOrderId") or "") == str(self.pending_cl_ord_id)
+                                for o in open_orders
+                            )
+                            
+                            if not is_still_alive:
+                                logger.info("✅ 板からの消失を確認。ゴースト約定を警戒し SETTLEMENT_PENDING(検疫) へ移行します。")
+                                self.state = "SETTLEMENT_PENDING"
+                                self.settlement_start_time = time.time()
+                            else:
+                                if time.time() - self.cancel_wait_start > 30:
+                                    logger.error("❌ 30秒経過しても板から消えません。再度キャンセルを送信します。")
+                                    self._cancel_all_orders()
+                                    self.cancel_wait_start = time.time()
                     except Exception as e: logger.error(f"WAIT_CANCEL 確認エラー: {e}")
 
                 elif self.state == "SETTLEMENT_PENDING":
@@ -1050,6 +1209,7 @@ class SodexAdvancedBotV2:
 
             except Exception as e: logger.error(f"例外: {e}", exc_info=True)
             time.sleep(5)
+
 
 if __name__ == "__main__":
     required_env = ["SODEX_API_KEY", "SODEX_PRIVATE_KEY", "SODEX_ACCOUNT_ID"]
