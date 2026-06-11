@@ -9,7 +9,7 @@
 
 To verify that DriftGuard OMS is a fully operational, production-grade infrastructure layer (and not a static visual simulation), please follow these steps:
 
-1. **Access the Live Telemetry Server:** Open [http://34.168.51.136:8501](http://34.168.51.136:8501) directly in your browser.
+1. **Access the Live Telemetry Server:** Open [https://takkimitti-sodex-volume-bot-dashboard-fvhbd6.streamlit.app/](https://takkimitti-sodex-volume-bot-dashboard-fvhbd6.streamlit.app/) directly in your browser (Secured via HTTPS).
 2. **Observe the Absolute Truth (UTC Sync):** Look at the **"Last Sync (UTC)"** clock at the top right. It synchronizes with your absolute browser clock down to the second, proving the hybrid frontend is pulling sub-second fresh state feeds while completely bypassing cloud Nginx caching layers.
 3. **Verify the Self-Healing Cycle:** * When the simulated WebSocket drop occurs (indicated under Connection Health), observe the **State Integrity Index** and **Divergence Count**.
    * Watch the system automatically suppress new entries, engage the dual-layer internal memory lock, and enforce an **Active Reconciliation Loop** against the ledger until consistency is restored.
@@ -34,7 +34,7 @@ Whenever a divergence ($D$) is detected, the system suppresses further execution
 
 During our live production stress testing, DriftGuard successfully isolated and contained infrastructure-level WebSocket desynchronization events and transient network spikes without a single microsecond of capital risk.
 
-* **Live Telemetry Interface:** [http://34.168.51.136:8501](http://34.168.51.136:8501) *(Decoupled Microservice Engine)*
+* **Live Telemetry Interface (Secure Cloud Web):** [https://takkimitti-sodex-volume-bot-dashboard-fvhbd6.streamlit.app/](https://takkimitti-sodex-volume-bot-dashboard-fvhbd6.streamlit.app/)
 
 ---
 
